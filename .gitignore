@@ -1,0 +1,8 @@
+/target
+.env
+config/backends.*.toml
+!config/backends.example.toml
+*.db
+*.db-shm
+*.db-wal
+roger_session/

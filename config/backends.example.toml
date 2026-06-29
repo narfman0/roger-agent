@@ -1,0 +1,40 @@
+# Copy to backends.<HOST_ROLE>.toml and fill in real values.
+# HOST_ROLE env var selects which file to load (default: local).
+# api_key_env is the name of the env var holding the key — never the key itself.
+
+# --- AI box (HOST_ROLE=local): local GPU, hits LM Studio + Ollama directly ---
+
+[backends.local-small]
+kind = "open-ai"
+base_url = "http://127.0.0.1:1234/v1"
+model = "google/gemma-4-e4b"
+api_key_env = ""
+
+[backends.local-reason]
+kind = "open-ai"
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen3"
+api_key_env = ""
+
+[backends.cloud-fast]
+kind = "open-ai"
+base_url = "http://srv:4000"
+model = "claude-sonnet"
+api_key_env = "GATEWAY_VKEY"
+
+[backends.cloud-heavy]
+# kind: "openai" | "claude-code" | "opencode"
+# "claude-code" spawns `claude -p --bare --output-format stream-json`
+# "opencode" spawns `opencode run` (future)
+kind = "claude-code"
+base_url = "http://srv:4000"
+model = "claude-opus"
+api_key_env = "GATEWAY_VKEY"
+
+# --- Server (HOST_ROLE=server): no GPU, everything via gateway ---
+
+# [backends.local-small]
+# kind = "open-ai"
+# base_url = "http://127.0.0.1:4000"
+# model = "claude-sonnet"
+# api_key_env = "GATEWAY_VKEY"
