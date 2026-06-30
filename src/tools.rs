@@ -54,6 +54,61 @@ pub fn tool_definitions() -> Value {
         {
             "type": "function",
             "function": {
+                "name": "read_file",
+                "description": "Read the contents of a file on the local filesystem. Use ~ for the home directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute or ~ path to the file"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write (or overwrite) a file on the local filesystem. Creates parent directories as needed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute or ~ path to the file"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Text content to write"
+                        }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_dir",
+                "description": "List the contents of a directory on the local filesystem.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute or ~ path to the directory"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "set_workdir",
                 "description": "Set the working directory (project) for this room's agentic coding agent. Call this when the user asks to work on, edit, or build a specific known project. The choice persists for the room until changed.",
                 "parameters": {
@@ -131,6 +186,19 @@ impl ToolExecutor {
             "web_fetch" => {
                 let url = args["url"].as_str().unwrap_or("").to_string();
                 self.web_fetch(&url).await
+            }
+            "read_file" => {
+                let path = args["path"].as_str().unwrap_or("").to_string();
+                read_file(&path)
+            }
+            "write_file" => {
+                let path = args["path"].as_str().unwrap_or("").to_string();
+                let content = args["content"].as_str().unwrap_or("").to_string();
+                write_file(&path, &content)
+            }
+            "list_dir" => {
+                let path = args["path"].as_str().unwrap_or("").to_string();
+                list_dir(&path)
             }
             "set_workdir" => {
                 let project = args["project"].as_str().unwrap_or("").to_string();
@@ -215,6 +283,87 @@ impl ToolExecutor {
             },
         }
     }
+}
+
+// ── File tools ───────────────────────────────────────────────────────────────
+
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if path.starts_with("~/") || path == "~" {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        std::path::PathBuf::from(path.replacen('~', &home, 1))
+    } else {
+        std::path::PathBuf::from(path)
+    }
+}
+
+fn read_file(path: &str) -> String {
+    if path.is_empty() {
+        return "error: path is required".into();
+    }
+    let p = expand_tilde(path);
+    match std::fs::read_to_string(&p) {
+        Err(e) => format!("error reading {}: {}", p.display(), e),
+        Ok(content) => {
+            const MAX: usize = 50_000;
+            if content.len() > MAX {
+                format!(
+                    "[{}]\n\n{}\n\n[truncated: {} of {} bytes shown]",
+                    p.display(),
+                    &content[..MAX],
+                    MAX,
+                    content.len()
+                )
+            } else {
+                format!("[{}]\n\n{}", p.display(), content)
+            }
+        }
+    }
+}
+
+fn write_file(path: &str, content: &str) -> String {
+    if path.is_empty() {
+        return "error: path is required".into();
+    }
+    let p = expand_tilde(path);
+    if let Some(parent) = p.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return format!("error creating directories for {}: {}", p.display(), e);
+        }
+    }
+    match std::fs::write(&p, content) {
+        Ok(()) => format!("wrote {} bytes to {}", content.len(), p.display()),
+        Err(e) => format!("error writing {}: {}", p.display(), e),
+    }
+}
+
+fn list_dir(path: &str) -> String {
+    let p = if path.is_empty() { expand_tilde("~") } else { expand_tilde(path) };
+    let entries = match std::fs::read_dir(&p) {
+        Err(e) => return format!("error listing {}: {}", p.display(), e),
+        Ok(it) => it,
+    };
+    let mut lines = vec![format!("[{}]", p.display())];
+    let mut items: Vec<(String, bool, u64)> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            let meta = e.metadata().ok();
+            let is_dir = meta.as_ref().map_or(false, |m| m.is_dir());
+            let size = meta.as_ref().map_or(0, |m| m.len());
+            (e.file_name().to_string_lossy().into_owned(), is_dir, size)
+        })
+        .collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, is_dir, size) in &items {
+        if *is_dir {
+            lines.push(format!("  {}/", name));
+        } else {
+            lines.push(format!("  {} ({} bytes)", name, size));
+        }
+    }
+    if items.is_empty() {
+        lines.push("  (empty)".into());
+    }
+    lines.join("\n")
 }
 
 // ── SearXNG response types ──────────────────────────────────────────────────
