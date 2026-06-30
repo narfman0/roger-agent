@@ -10,12 +10,6 @@ base_url = "http://127.0.0.1:1234/v1"
 model = "google/gemma-4-e4b"
 api_key_env = ""
 
-[backends.local-reason]
-kind = "open-ai"
-base_url = "http://127.0.0.1:11434/v1"
-model = "qwen3"
-api_key_env = ""
-
 [backends.cloud-fast]
 kind = "open-ai"
 base_url = "http://srv:4000"

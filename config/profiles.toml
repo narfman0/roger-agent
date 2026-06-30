@@ -22,7 +22,8 @@ latency_class = "slow"
 idle_timeout_ms = 180000
 
 [profiles.reason]
-backend = "local-reason"
+backend = "local-small"      # gemma (local)
+fallback = ["cloud-heavy"]   # opus (via gateway) when gemma is unavailable
 comms = "auto"
 latency_class = "fast"
 
