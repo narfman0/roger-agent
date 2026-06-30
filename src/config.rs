@@ -112,7 +112,7 @@ impl BackendConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CommsConfig {
     #[serde(default = "default_sync_budget")]
     pub sync_budget_ms: u64,

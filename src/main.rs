@@ -8,6 +8,7 @@ mod metrics;
 mod room_profiles;
 mod subprocess;
 mod tools;
+mod workers;
 
 use anyhow::Result;
 use matrix_sdk::config::SyncSettings;
@@ -85,10 +86,17 @@ async fn reload_on_sighup(config_dir: PathBuf, state: Arc<RwLock<ReloadableState
                 continue;
             }
         };
+        let profile_comms = cfg
+            .profiles
+            .iter()
+            .map(|(k, p)| (k.clone(), p.comms.clone()))
+            .collect();
         let mut st = state.write().await;
         st.llms = llms.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
         st.system_prompt = cfg.system_prompt;
         st.room_configs = cfg.rooms;
+        st.comms = cfg.comms;
+        st.profile_comms = profile_comms;
         // Drop runtime /model overrides that point at a profile that no longer builds.
         let valid: HashSet<String> = st.llms.keys().cloned().collect();
         st.room_profiles.retain(|_, profile| valid.contains(profile));
@@ -179,11 +187,20 @@ async fn main() -> Result<()> {
         info!("loaded {} persisted /model override(s)", room_profiles_map.len());
     }
 
+    let profile_comms = cfg
+        .profiles
+        .iter()
+        .map(|(k, p)| (k.clone(), p.comms.clone()))
+        .collect();
+    let workers = Arc::new(workers::Workers::new(cfg.comms.soft_worker_cap));
+
     let state = Arc::new(RwLock::new(ReloadableState {
         llms,
         system_prompt: cfg.system_prompt,
         room_configs: cfg.rooms,
         room_profiles: room_profiles_map,
+        comms: cfg.comms,
+        profile_comms,
     }));
 
     // Spawn the SIGHUP hot-reload listener
@@ -200,6 +217,7 @@ async fn main() -> Result<()> {
         room_profiles: room_profile_store,
         metrics: Arc::new(metrics::Metrics::default()),
         tool_executor,
+        workers,
     };
 
     client.add_event_handler_context(bot_ctx);

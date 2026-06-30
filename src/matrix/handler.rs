@@ -1,11 +1,12 @@
 use crate::{
     audio::SpeachesClient,
-    config::RoomConfig,
+    config::{CommsConfig, CommsMode, RoomConfig},
     history::{ChatMessage, HistoryStore},
     llm::ProfileLlm,
     metrics::Metrics,
     room_profiles::RoomProfileStore,
     tools::ToolExecutor,
+    workers::{JobHandle, Workers},
 };
 use matrix_sdk::{
     event_handler::Ctx,
@@ -29,14 +30,32 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::sleep;
 use tracing::{info, warn};
 
-/// Streaming flush cadence. We post/update the response when a sentence completes
-/// OR `MAX_FLUSH_WAIT_MS` has passed since the last update (whichever first), but
-/// never more often than `MIN_FLUSH_GAP_MS`. The typing indicator covers the gap
-/// before the first flush, so there's no placeholder message.
-const MIN_FLUSH_GAP_MS: u64 = 250;
-const MAX_FLUSH_WAIT_MS: u64 = 1000;
+/// Streaming flush cadence, derived from `CommsConfig::edit_debounce_ms`. We
+/// post/update the response when a sentence completes OR `max_wait` has passed
+/// since the last update (whichever first), but never more often than `min_gap`.
+/// The typing indicator covers the gap before the first flush, so there's no
+/// placeholder message (except in async/promoted jobs, which post a "Working…"
+/// anchor up front).
+#[derive(Clone, Copy)]
+struct FlushCadence {
+    min_gap: Duration,
+    max_wait: Duration,
+}
+
+impl FlushCadence {
+    fn from_comms(c: &CommsConfig) -> Self {
+        let min_gap = Duration::from_millis(c.edit_debounce_ms);
+        // Force a flush at least this often even without a sentence boundary.
+        let max_wait = Duration::from_millis(c.edit_debounce_ms.max(1000));
+        FlushCadence { min_gap, max_wait }
+    }
+}
+
+/// Placeholder shown by async / auto-promoted jobs before the first content flush.
+const WORKING_ANCHOR: &str = "🛠️ Working…";
 
 /// Byte index of the last sentence-ending boundary in `s` (`.`, `!`, `?`, or a
 /// newline), if any.
@@ -76,6 +95,10 @@ pub struct ReloadableState {
     pub room_configs: HashMap<String, RoomConfig>,
     /// Runtime per-room profile overrides set via `/model`, keyed by room id.
     pub room_profiles: HashMap<String, String>,
+    /// Global comms budgets (sync_budget_ms, edit_debounce_ms, …).
+    pub comms: CommsConfig,
+    /// Per-profile comms mode (sync / async / auto), keyed by profile name.
+    pub profile_comms: HashMap<String, CommsMode>,
 }
 
 impl ReloadableState {
@@ -89,6 +112,15 @@ impl ReloadableState {
             .get(room_id)
             .and_then(|r| r.profile.clone())
             .unwrap_or_else(|| "chat".to_string())
+    }
+
+    /// Comms mode for a profile (sync / async / auto); defaults to sync for an
+    /// unknown profile.
+    pub fn comms_mode_for_profile(&self, profile: &str) -> CommsMode {
+        self.profile_comms
+            .get(profile)
+            .cloned()
+            .unwrap_or(CommsMode::Sync)
     }
 
     /// Resolve the LLM for a room. Returns the profile LLM and the profile name
@@ -119,6 +151,8 @@ pub struct BotCtx {
     pub metrics: Arc<Metrics>,
     /// Tool executor for web_search / web_fetch.
     pub tool_executor: Arc<ToolExecutor>,
+    /// Background-job registry (sync/async/auto response tasks).
+    pub workers: Arc<Workers>,
 }
 
 impl BotCtx {
@@ -217,16 +251,13 @@ pub async fn handle_message(
         return;
     }
 
-    // Show the typing indicator while we wait for the model — no placeholder message.
-    let _ = room.typing_notice(true).await;
-
-    // Build context: system prompt + history + current message.
-    // Snapshot the reloadable bits (LLM client + resolved system prompt) and drop
-    // the read lock before the long-running LLM call so SIGHUP reloads aren't blocked.
+    // Persist the user turn, then snapshot the reloadable bits and drop the read
+    // lock before spawning the (possibly long) response job so SIGHUP reloads
+    // aren't blocked.
     if let Err(e) = ctx.history.append(&room_id, ChatMessage::user(&body)) {
         warn!("failed to save user message to history: {}", e);
     }
-    let (llm, system_prompt, profile, model) = {
+    let (llm, system_prompt, profile, model, comms_mode, comms_cfg) = {
         let st = ctx.state.read().await;
         let prompt = st
             .room_configs
@@ -235,35 +266,125 @@ pub async fn handle_message(
             .unwrap_or_else(|| st.system_prompt.clone());
         let (client, profile) = st.llm_for_room(&room_id);
         let model = client.model().to_string();
-        (client, prompt, profile, model)
+        let mode = st.comms_mode_for_profile(&profile);
+        (client, prompt, profile, model, mode, st.comms.clone())
     };
+
+    // Serialize agentic jobs per room — two agents in one working directory clash.
+    let agentic = llm.is_subprocess();
+    if agentic && ctx.workers.agentic_active_in_room(&room_id) {
+        let _ = room
+            .send(RoomMessageEventContent::text_plain(
+                "I'm already running a job in this room. Use `/cancel <id>` or wait for it to finish.",
+            ))
+            .await;
+        return;
+    }
+
     let budget = llm.history_token_budget(crate::history::estimate_tokens(&system_prompt));
     let mut messages = vec![ChatMessage::system(&system_prompt)];
     messages.extend(ctx.history.windowed_by_tokens(&room_id, budget));
 
-    // Stream the LLM response. We flush (post the first message, then edit it in
-    // place) on sentence boundaries or once MAX_FLUSH_WAIT_MS passes — whichever
-    // comes first — but never more often than MIN_FLUSH_GAP_MS. The typing
-    // indicator covers the wait, so there's no "Working on it…" placeholder.
+    let flush = FlushCadence::from_comms(&comms_cfg);
+    // Async jobs post a "Working…" anchor up front; sync/auto rely on the typing
+    // indicator until the first content flush.
+    let ack_first = matches!(comms_mode, CommsMode::Async);
+
+    // The whole response pipeline runs as one self-contained task (produce →
+    // stream → fallback → metrics → history → final render). The handler then
+    // either awaits it (sync), detaches it (async), or races it against the sync
+    // budget and promotes it to the background on timeout (auto).
+    let job_id = ctx.workers.insert_pending(JobHandle {
+        room: room_id.clone(),
+        profile: profile.clone(),
+        model: model.clone(),
+        started: Instant::now(),
+        agentic,
+        abort: None,
+    });
+    let workers = ctx.workers.clone();
+    let bot = (*ctx).clone();
+    let job = {
+        let room = room.clone();
+        tokio::spawn(async move {
+            run_response_job(room, room_id, messages, llm, bot, profile, model, flush, ack_first)
+                .await;
+            workers.remove(job_id);
+        })
+    };
+    ctx.workers.set_abort(job_id, job.abort_handle());
+
+    match comms_mode {
+        // Detached: the job owns its message and lifecycle from here.
+        CommsMode::Async => {}
+        CommsMode::Sync => {
+            let _ = job.await;
+        }
+        CommsMode::Auto => {
+            let sync_budget = Duration::from_millis(comms_cfg.sync_budget_ms);
+            tokio::pin!(job);
+            tokio::select! {
+                _ = &mut job => {}
+                _ = sleep(sync_budget) => {
+                    // Promote to background; the job keeps streaming into its message.
+                    let _ = room
+                        .send(RoomMessageEventContent::text_plain(
+                            "⏳ Still working on this — I'll update the message here when it's ready.",
+                        ))
+                        .await;
+                }
+            }
+        }
+    }
+}
+
+/// The full response pipeline for one turn, run as a single self-contained task so
+/// it is correct whether the handler awaits it (sync) or detaches it (async/auto).
+/// Produces via the LLM, streams flushes into a Matrix message, falls back to a
+/// non-streaming call if needed, records metrics, persists the reply, and renders
+/// the final text.
+#[allow(clippy::too_many_arguments)]
+async fn run_response_job(
+    room: Room,
+    room_id: String,
+    messages: Vec<ChatMessage>,
+    llm: Arc<ProfileLlm>,
+    bot: BotCtx,
+    profile: String,
+    model: String,
+    flush: FlushCadence,
+    ack_first: bool,
+) {
+    let _ = room.typing_notice(true).await;
     let req_start = Instant::now();
+
     let (tx, mut rx) = mpsc::channel::<String>(64);
     let stream_handle = {
         let llm = llm.clone();
         let messages = messages.clone();
-        let executor = ctx.tool_executor.clone();
+        let executor = bot.tool_executor.clone();
         tokio::spawn(async move { llm.chat_with_tools(&messages, Some(&executor), tx).await })
     };
 
-    let min_gap = Duration::from_millis(MIN_FLUSH_GAP_MS);
-    let max_wait = Duration::from_millis(MAX_FLUSH_WAIT_MS);
+    // For async jobs, post a placeholder anchor immediately so the user sees the
+    // job started; content flushes then edit it in place.
     let mut msg_id: Option<OwnedEventId> = None;
-    let mut last_flush: Option<Instant> = None;
     let mut shown = String::new();
+    if ack_first {
+        if let Ok(resp) = room
+            .send(RoomMessageEventContent::text_plain(WORKING_ANCHOR))
+            .await
+        {
+            msg_id = Some(resp.event_id);
+            shown = WORKING_ANCHOR.to_string();
+        }
+    }
+
+    let mut last_flush: Option<Instant> = None;
     while let Some(acc) = rx.recv().await {
-        // Time since the last flush, or since the request started for the first one.
         let elapsed = last_flush.unwrap_or(req_start).elapsed();
         let sentence_ready = last_sentence_end(&acc).map_or(false, |i| i >= shown.len());
-        if !should_flush(acc != shown, elapsed, sentence_ready, min_gap, max_wait) {
+        if !should_flush(acc != shown, elapsed, sentence_ready, flush.min_gap, flush.max_wait) {
             continue;
         }
         match &msg_id {
@@ -283,8 +404,6 @@ pub async fn handle_message(
     let streamed = stream_handle.await;
     let _ = room.typing_notice(false).await;
 
-    // Resolve the final text: the streamed result, falling back to a non-streaming
-    // request if the stream errored or produced nothing (backend without SSE support).
     let result: anyhow::Result<String> = match streamed {
         Ok(Ok(text)) if !text.trim().is_empty() => Ok(text),
         Ok(Ok(_)) => llm.chat(&messages).await,
@@ -295,24 +414,14 @@ pub async fn handle_message(
         Err(e) => Err(anyhow::anyhow!("stream task failed: {}", e)),
     };
 
-    // Record metrics and emit a structured per-request log line.
     let latency_ms = req_start.elapsed().as_millis() as u64;
     let ok = result.is_ok();
-    ctx.metrics.record(latency_ms, ok);
-    info!(
-        room = %room_id,
-        profile = %profile,
-        model = %model,
-        latency_ms,
-        ok,
-        "responded"
-    );
+    bot.metrics.record(latency_ms, ok);
+    info!(room = %room_id, profile = %profile, model = %model, latency_ms, ok, "responded");
 
-    // Render the final text: edit the message in place if we already posted one,
-    // otherwise send it fresh (short responses that never hit the paint threshold).
     let final_text = match result {
         Ok(reply) => {
-            if let Err(e) = ctx.history.append(&room_id, ChatMessage::assistant(&reply)) {
+            if let Err(e) = bot.history.append(&room_id, ChatMessage::assistant(&reply)) {
                 warn!("failed to save assistant reply to history: {}", e);
             }
             reply
@@ -357,7 +466,9 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
              `/help` — show this list\n\
              `/clear` — wipe conversation history for this room\n\
              `/status` — show uptime, model, and history stats\n\
-             `/model [name]` — show/switch this room's LLM profile (`/model reset` to revert)"
+             `/model [name]` — show/switch this room's LLM profile (`/model reset` to revert)\n\
+             `/jobs` — list active background jobs\n\
+             `/cancel <id>` — cancel a running background job"
                 .to_string(),
         ),
         "/clear" => {
@@ -380,10 +491,35 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
                 client.model().to_string()
             };
             Some(format!(
-                "**Roger status**\nUptime: {}h {}m {}s\nProfile: {} ({})\nHistory: {} messages (this room)\nRequests: {} ({} errors), avg {}ms",
+                "**Roger status**\nUptime: {}h {}m {}s\nProfile: {} ({})\nHistory: {} messages (this room)\nRequests: {} ({} errors), avg {}ms\nActive jobs: {}",
                 h, m, s, profile, model_desc, history_len,
-                m_snap.requests, m_snap.errors, m_snap.avg_latency_ms
+                m_snap.requests, m_snap.errors, m_snap.avg_latency_ms,
+                ctx.workers.count()
             ))
+        }
+        "/jobs" => {
+            let jobs = ctx.workers.list();
+            if jobs.is_empty() {
+                Some("No active background jobs.".to_string())
+            } else {
+                let mut out = String::from("**Active jobs**\n");
+                for j in jobs {
+                    out.push_str(&format!(
+                        "`{}` — {} ({}), {}s\n",
+                        j.id, j.profile, j.model, j.elapsed_secs
+                    ));
+                }
+                out.push_str("`/cancel <id>` to stop one.");
+                Some(out)
+            }
+        }
+        "/cancel" => {
+            let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+            match arg.parse::<u64>() {
+                Ok(id) if ctx.workers.cancel(id) => Some(format!("Cancelled job `{}`.", id)),
+                Ok(id) => Some(format!("No active job `{}`. Try `/jobs`.", id)),
+                Err(_) => Some("Usage: `/cancel <id>` (see `/jobs`).".to_string()),
+            }
         }
         "/model" => Some(handle_model_command(parts.get(1).copied(), room_id, ctx).await),
         _ => Some(format!("Unknown command `{}`. Try `/help`.", parts[0])),
@@ -502,11 +638,16 @@ mod tests {
                 profile: Some("reason".into()),
             },
         );
+        let mut profile_comms = HashMap::new();
+        profile_comms.insert("chat".to_string(), CommsMode::Sync);
+        profile_comms.insert("reason".to_string(), CommsMode::Auto);
         ReloadableState {
             llms,
             system_prompt: "sys".into(),
             room_configs,
             room_profiles: HashMap::new(),
+            comms: CommsConfig::default(),
+            profile_comms,
         }
     }
 
@@ -558,6 +699,7 @@ mod tests {
             room_profiles: Arc::new(RoomProfileStore::new(dir.path().join("rp.json"))),
             metrics: Arc::new(Metrics::default()),
             tool_executor: Arc::new(ToolExecutor::new(None)),
+            workers: Arc::new(Workers::new(4)),
         }
     }
 

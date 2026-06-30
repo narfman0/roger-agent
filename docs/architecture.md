@@ -131,6 +131,49 @@ Counters reset on restart.
 
 ## Backend kinds
 
-- `open-ai` — standard OpenAI-compatible REST API (LM Studio, Ollama, LiteLLM)
-- `claude-code` — reserved for spawning `claude -p` subprocess (not yet implemented)
-- `open-code` — reserved for `opencode run` subprocess (future)
+A profile's chain is built from named backends, dispatched on `kind`
+(`Config::build_client` → `llm::Backend`):
+
+- `open-ai` — OpenAI-compatible REST (LM Studio, Ollama, LiteLLM). `Backend::Http`.
+- `claude-code` — spawns the `claude` CLI as an agentic subprocess per turn
+  (`src/subprocess.rs`, `Backend::Subprocess`). Implemented.
+- `open-code` — `opencode run` subprocess. Stubbed: returns "not yet supported"
+  (its non-interactive JSON schema isn't verified yet), so a chain fails over.
+
+### Subprocess backends
+
+A subprocess backend inverts the HTTP model: the CLI owns its own agentic tool
+loop (file edits, bash, web), so roger's `ToolExecutor` is bypassed; history is
+passed statelessly each turn (rendered into the prompt — system prompt via
+`--append-system-prompt`, no `--session-id`), so the *files in the working
+directory* are the persistent state. claude is run with `--print --output-format
+stream-json --verbose --include-partial-messages --permission-mode <mode>
+--model <m>`; `content_block_delta`/`text_delta` events feed the same accumulated
+-text channel as the HTTP streamer, and the terminal `result` event is the
+authoritative final string. Auth maps the gateway via `ANTHROPIC_BASE_URL` +
+`ANTHROPIC_AUTH_TOKEN` (the Anthropic key never leaves `srv`). Lifecycle: a
+process-wide semaphore (`max_concurrent_children`), per-line idle timeout,
+wall-clock absolute ceiling, optional `--max-budget-usd`/`--max-turns`, and
+`kill_on_drop` + `process_group(0)` + `killpg` for whole-tree kill. The working
+directory comes from `comms.default_workdir` (per-room/LLM selection lands in a
+later task).
+
+## Orchestrator: comms modes
+
+The whole response pipeline for a turn (produce → stream → fallback → metrics →
+history append → final render) runs as **one self-contained task**
+(`run_response_job`), so it is correct whether the handler awaits or detaches it.
+Each profile has a `comms` mode (`ReloadableState::comms_mode_for_profile`):
+
+- `sync` — handler awaits the task (today's UX: typing indicator, streamed edits).
+- `async` — the task posts a "🛠️ Working…" anchor, the handler registers it and
+  returns; it streams edits into that anchor while the user keeps chatting.
+- `auto` — `select!` the task against `sleep(sync_budget_ms)`; if the budget fires
+  first, post a "still working" note and let the task finish in the background.
+
+Background jobs live in a `Workers` registry (`src/workers.rs`) in `BotCtx`: a
+job id → handle map with abort handles. It powers `/status` (active count),
+`/jobs` (list), `/cancel <id>` (abort → kill the subprocess tree), a soft cap
+warning (`soft_worker_cap`), and per-room serialization of agentic jobs (one
+subprocess per room workdir at a time). Flush cadence comes from the reloadable
+`CommsConfig::edit_debounce_ms`.

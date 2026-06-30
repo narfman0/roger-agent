@@ -374,6 +374,11 @@ impl Backend {
             Backend::Subprocess(s) => s.chat_stream(messages, tx).await,
         }
     }
+
+    /// True for agentic subprocess backends (claude-code / opencode).
+    pub fn is_subprocess(&self) -> bool {
+        matches!(self, Backend::Subprocess(_))
+    }
 }
 
 /// An LLM profile backed by an ordered chain of backends: a primary and zero or
@@ -399,6 +404,11 @@ impl ProfileLlm {
     /// Number of fallback clients behind the primary.
     pub fn fallback_count(&self) -> usize {
         self.clients.len().saturating_sub(1)
+    }
+
+    /// True when the primary backend is an agentic subprocess (claude-code).
+    pub fn is_subprocess(&self) -> bool {
+        self.clients.first().map_or(false, |c| c.is_subprocess())
     }
 
     /// Model names in priority order (primary first).
