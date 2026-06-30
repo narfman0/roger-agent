@@ -4,6 +4,7 @@ mod error;
 mod history;
 mod llm;
 mod matrix;
+mod room_profiles;
 
 use anyhow::Result;
 use matrix_sdk::config::SyncSettings;
@@ -139,11 +140,21 @@ async fn main() -> Result<()> {
     let history = Arc::new(history::HistoryStore::new(session_dir.join("history"))?);
     info!("history store initialized");
 
+    // Load persisted /model overrides, dropping any that name a profile that
+    // isn't built on this host.
+    let room_profile_store =
+        Arc::new(room_profiles::RoomProfileStore::new(session_dir.join("room_profiles.json")));
+    let mut room_profiles_map = room_profile_store.load();
+    room_profiles_map.retain(|_, profile| llms.contains_key(profile));
+    if !room_profiles_map.is_empty() {
+        info!("loaded {} persisted /model override(s)", room_profiles_map.len());
+    }
+
     let state = Arc::new(RwLock::new(ReloadableState {
         llms,
         system_prompt: cfg.system_prompt,
         room_configs: cfg.rooms,
-        room_profiles: HashMap::new(),
+        room_profiles: room_profiles_map,
     }));
 
     // Spawn the SIGHUP hot-reload listener
@@ -157,6 +168,7 @@ async fn main() -> Result<()> {
         history,
         started_at: Arc::new(Instant::now()),
         state,
+        room_profiles: room_profile_store,
     };
 
     client.add_event_handler_context(bot_ctx);

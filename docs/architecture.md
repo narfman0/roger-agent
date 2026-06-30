@@ -61,6 +61,10 @@ Each room resolves to a profile via `ReloadableState::llm_for_room`:
 If the resolved profile has no built client, it falls back to `chat`. The resolved
 profile + model are shown in `/status`.
 
+Runtime `/model` overrides are persisted to `roger_session/room_profiles.json`
+(`RoomProfileStore`) and reloaded on startup; overrides for profiles that don't
+build on this host are dropped on load and on reload.
+
 ## Config hot-reload
 
 Reloadable config lives behind `Arc<RwLock<ReloadableState>>` (in `matrix/handler.rs`),

@@ -3,6 +3,7 @@ use crate::{
     config::RoomConfig,
     history::{ChatMessage, HistoryStore},
     llm::LlmClient,
+    room_profiles::RoomProfileStore,
 };
 use matrix_sdk::{
     event_handler::Ctx,
@@ -68,6 +69,8 @@ pub struct BotCtx {
     pub history: Arc<HistoryStore>,
     pub started_at: Arc<Instant>,
     pub state: Arc<RwLock<ReloadableState>>,
+    /// Persists `/model` runtime overrides across restarts.
+    pub room_profiles: Arc<RoomProfileStore>,
 }
 
 impl BotCtx {
@@ -249,7 +252,8 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
             "**Roger commands**\n\
              `/help` — show this list\n\
              `/clear` — wipe conversation history for this room\n\
-             `/status` — show uptime, model, and history stats"
+             `/status` — show uptime, model, and history stats\n\
+             `/model [name]` — show/switch this room's LLM profile (`/model reset` to revert)"
                 .to_string(),
         ),
         "/clear" => {
@@ -270,7 +274,62 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
                 h, m, s, profile, client.model(), history_len
             ))
         }
+        "/model" => Some(handle_model_command(parts.get(1).copied(), room_id, ctx).await),
         _ => Some(format!("Unknown command `{}`. Try `/help`.", parts[0])),
+    }
+}
+
+/// `/model` — show or switch the LLM profile for this room. Persists overrides.
+async fn handle_model_command(arg: Option<&str>, room_id: &str, ctx: &BotCtx) -> String {
+    let arg = arg.map(str::trim).unwrap_or("");
+
+    // No argument: report current profile + the available ones.
+    if arg.is_empty() {
+        let st = ctx.state.read().await;
+        let current = st.profile_name_for_room(room_id);
+        let mut names: Vec<String> = st.llms.keys().cloned().collect();
+        names.sort();
+        let list = names
+            .iter()
+            .map(|n| format!("`{}`", n))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!(
+            "Current profile: `{}`\nAvailable: {}\n`/model <name>` to switch · `/model reset` to revert to default",
+            current, list
+        );
+    }
+
+    let reset = arg == "reset" || arg == "default";
+
+    // Mutate the in-memory map under the write lock, then snapshot it for persistence.
+    let snapshot = {
+        let mut st = ctx.state.write().await;
+        if reset {
+            st.room_profiles.remove(room_id);
+        } else if st.llms.contains_key(arg) {
+            st.room_profiles.insert(room_id.to_string(), arg.to_string());
+        } else {
+            let mut names: Vec<String> = st.llms.keys().cloned().collect();
+            names.sort();
+            return format!(
+                "Unknown profile `{}`. Available: {}",
+                arg,
+                names.join(", ")
+            );
+        }
+        st.room_profiles.clone()
+    };
+
+    if let Err(e) = ctx.room_profiles.save(&snapshot) {
+        warn!("failed to persist room profiles: {}", e);
+    }
+
+    let (client, profile) = ctx.state.read().await.llm_for_room(room_id);
+    if reset {
+        format!("Reset to default profile: `{}` ({})", profile, client.model())
+    } else {
+        format!("Switched to profile `{}` ({})", profile, client.model())
     }
 }
 
@@ -301,6 +360,10 @@ async fn transcribe_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::HistoryStore;
+    use crate::room_profiles::RoomProfileStore;
+    use std::collections::HashSet;
+    use tempfile::TempDir;
 
     fn client(model: &str) -> Arc<LlmClient> {
         Arc::new(LlmClient::new(
@@ -368,5 +431,69 @@ mod tests {
         let (client, profile) = st.llm_for_room("!coding:srv");
         assert_eq!(profile, "chat");
         assert_eq!(client.model(), "chat-model");
+    }
+
+    fn test_ctx(dir: &TempDir) -> BotCtx {
+        BotCtx {
+            allowed_rooms: HashSet::new(),
+            bot_user_id: "@roger:srv".into(),
+            bot_localpart: "roger".into(),
+            speaches: None,
+            history: Arc::new(HistoryStore::new(dir.path().join("history")).unwrap()),
+            started_at: Arc::new(Instant::now()),
+            state: Arc::new(RwLock::new(state())),
+            room_profiles: Arc::new(RoomProfileStore::new(dir.path().join("rp.json"))),
+        }
+    }
+
+    #[tokio::test]
+    async fn model_no_arg_lists_available() {
+        let dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&dir);
+        let out = handle_model_command(None, "!coding:srv", &ctx).await;
+        assert!(out.contains("Current profile: `reason`"));
+        assert!(out.contains("`chat`") && out.contains("`reason`"));
+    }
+
+    #[tokio::test]
+    async fn model_switch_persists_and_applies() {
+        let dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&dir);
+        let out = handle_model_command(Some("chat"), "!coding:srv", &ctx).await;
+        assert!(out.contains("Switched to profile `chat`"));
+        // In-memory state updated
+        assert_eq!(
+            ctx.state.read().await.profile_name_for_room("!coding:srv"),
+            "chat"
+        );
+        // Persisted to disk
+        assert_eq!(
+            ctx.room_profiles.load().get("!coding:srv").map(String::as_str),
+            Some("chat")
+        );
+    }
+
+    #[tokio::test]
+    async fn model_unknown_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&dir);
+        let out = handle_model_command(Some("bogus"), "!coding:srv", &ctx).await;
+        assert!(out.starts_with("Unknown profile `bogus`"));
+        // Unchanged: still the room-config default
+        assert_eq!(
+            ctx.state.read().await.profile_name_for_room("!coding:srv"),
+            "reason"
+        );
+        assert!(ctx.room_profiles.load().is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_reset_clears_override() {
+        let dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&dir);
+        handle_model_command(Some("chat"), "!coding:srv", &ctx).await;
+        let out = handle_model_command(Some("reset"), "!coding:srv", &ctx).await;
+        assert!(out.contains("Reset to default profile: `reason`"));
+        assert!(ctx.room_profiles.load().is_empty());
     }
 }

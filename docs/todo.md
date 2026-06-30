@@ -101,7 +101,7 @@ better context handling, streaming, and observability.
 | # | Task | Status |
 |---|------|--------|
 | 1 | Profile routing (per-room profile → LLM client) | ✅ Done |
-| 2 | `/model <profile>` runtime per-room switch | ⏳ |
+| 2 | `/model <profile>` runtime per-room switch | ✅ Done |
 | 3 | History token budgeting | ⏳ |
 | 4 | Streaming responses (debounced ack edits) | ⏳ |
 | 5 | Metrics: request counts, latency, error rate | ⏳ |
@@ -116,3 +116,10 @@ better context handling, streaming, and observability.
 runtime override → room config → `chat`, falling back to `chat` if the chosen
 profile has no client. `/status` shows the resolved profile and model. See
 `docs/architecture.md` → Profile routing.
+
+### `/model` command (#2)
+`/model` shows the room's current profile + available profiles; `/model <name>`
+switches it; `/model reset` reverts to the configured default. Overrides are held
+in `ReloadableState.room_profiles` and persisted to
+`roger_session/room_profiles.json` (`RoomProfileStore`) so they survive restarts.
+On load and on reload, overrides naming an unbuilt profile are dropped.
