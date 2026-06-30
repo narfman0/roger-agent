@@ -1,6 +1,5 @@
 mod audio;
 mod config;
-mod error;
 mod history;
 mod llm;
 mod matrix;

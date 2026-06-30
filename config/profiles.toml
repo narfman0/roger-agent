@@ -8,19 +8,16 @@ max_tokens = 1024
 # Approximate model context window; sizes the history token budget. Default 8192.
 context_tokens = 8192
 comms = "sync"
-latency_class = "fast"
 
 [profiles.fast]
 backend = "cloud-fast"
 comms = "sync"
-latency_class = "fast"
 
 # cloud-heavy is a kind = "claude-code" backend (see backends.example.toml): each
 # turn spawns the claude CLI as an agentic subprocess in the room's workdir.
 [profiles.code]
 backend = "cloud-heavy"
 comms = "async"
-latency_class = "slow"
 idle_timeout_ms = 180000
 # Subprocess controls (claude-code/opencode only):
 permission_mode = "acceptEdits"   # "bypassPermissions" to also allow bash autonomously
@@ -31,21 +28,14 @@ permission_mode = "acceptEdits"   # "bypassPermissions" to also allow bash auton
 backend = "local-small"      # gemma via Ollama (local)
 fallback = ["cloud-heavy"]   # opus (via gateway) when Ollama is unavailable
 comms = "auto"
-latency_class = "fast"
 
 [profiles.research]
 backend = "cloud-fast"
 comms = "auto"
-latency_class = "fast"
 
-[routing.task_profiles]
-code = "code"
-design = "reason"
-research = "research"
-analysis = "reason"
-
+# comms = sync | async | auto. sync awaits inline; async acks + runs in the
+# background; auto starts inline and promotes to background past sync_budget_ms.
 [comms]
-default_mode = "auto"
 sync_budget_ms = 7000
 idle_timeout_ms = 60000
 absolute_ceiling_ms = 1800000

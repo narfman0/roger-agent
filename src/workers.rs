@@ -24,7 +24,6 @@ pub struct JobHandle {
 /// A point-in-time view of one active job for display.
 pub struct JobInfo {
     pub id: u64,
-    pub room: String,
     pub profile: String,
     pub model: String,
     pub elapsed_secs: u64,
@@ -100,7 +99,6 @@ impl Workers {
             .iter()
             .map(|(&id, j)| JobInfo {
                 id,
-                room: j.room.clone(),
                 profile: j.profile.clone(),
                 model: j.model.clone(),
                 elapsed_secs: j.started.elapsed().as_secs(),

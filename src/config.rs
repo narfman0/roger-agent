@@ -33,19 +33,6 @@ impl Default for CommsMode {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LatencyClass {
-    Fast,
-    Slow,
-}
-
-impl Default for LatencyClass {
-    fn default() -> Self {
-        LatencyClass::Fast
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendKind {
@@ -77,8 +64,6 @@ pub struct ProfileConfig {
     pub context_tokens: Option<u32>,
     #[serde(default)]
     pub comms: CommsMode,
-    #[serde(default)]
-    pub latency_class: LatencyClass,
     #[serde(default)]
     pub idle_timeout_ms: Option<u64>,
     /// Subprocess backends only: `--permission-mode` (default "acceptEdits").
@@ -153,12 +138,6 @@ impl Default for CommsConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct RoutingConfig {
-    #[serde(default)]
-    pub task_profiles: HashMap<String, String>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct RoomConfig {
     #[serde(default)]
@@ -199,8 +178,6 @@ fn inject_date(s: &str) -> String {
 struct ProfilesFile {
     profiles: HashMap<String, ProfileConfig>,
     #[serde(default)]
-    routing: Option<RoutingConfig>,
-    #[serde(default)]
     comms: Option<CommsConfig>,
     #[serde(default)]
     rooms: HashMap<String, RoomConfig>,
@@ -218,7 +195,6 @@ struct BackendsFile {
 pub struct Config {
     pub profiles: HashMap<String, ProfileConfig>,
     pub backends: HashMap<String, BackendConfig>,
-    pub routing: RoutingConfig,
     pub comms: CommsConfig,
     pub rooms: HashMap<String, RoomConfig>,
     /// Known projects (name → path) selectable via the `set_workdir` tool.
@@ -285,9 +261,6 @@ impl Config {
         Ok(Config {
             profiles: profiles_file.profiles,
             backends: backends_file.backends,
-            routing: profiles_file.routing.unwrap_or_else(|| RoutingConfig {
-                task_profiles: HashMap::new(),
-            }),
             comms: profiles_file.comms.unwrap_or_default(),
             rooms,
             projects: profiles_file.projects,

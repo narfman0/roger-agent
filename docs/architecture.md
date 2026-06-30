@@ -35,23 +35,26 @@ where `context_tokens` is a per-profile config value (default 8192).
 ## Response UX
 
 For every response:
-1. `room.typing_notice(true)` — shows the typing indicator in Matrix clients
-2. Stream the LLM response (`ProfileLlm::chat_stream`): SSE deltas are accumulated
-   and pushed over an mpsc channel. The handler flushes (posts the first message,
-   then edits it in place via `m.replace`) when a **sentence boundary** appears OR
-   `MAX_FLUSH_WAIT_MS` (1s) has passed since the last flush — whichever comes
-   first — but never more often than `MIN_FLUSH_GAP_MS` (250ms). The flush decision
-   is `should_flush()`; sentence boundaries are found by `last_sentence_end()`.
-   There is no placeholder; the typing indicator covers the wait before the first
-   flush.
+1. `room.typing_notice(true)` — shows the typing indicator in Matrix clients.
+2. The producer (`chat_with_tools`) pushes accumulated-text snapshots over an mpsc
+   channel. How much arrives incrementally depends on the backend: an HTTP backend
+   runs its tool loop and then sends the synthesized final answer as **one** chunk
+   (non-streaming, so Matrix clients don't flicker through near-identical edits);
+   the claude subprocess sends true token deltas; the opencode subprocess sends the
+   whole reply in one chunk. The handler flushes (posts the first message, then
+   edits it in place via `m.replace`) on a **sentence boundary** or once the flush
+   ceiling passes — whichever first — but never faster than the rate floor. The
+   flush decision is `should_flush()`; the cadence comes from
+   `CommsConfig::edit_debounce_ms` (`FlushCadence`). There is no placeholder for
+   sync turns — the typing indicator covers the wait; async/promoted jobs post a
+   "🛠️ Working…" anchor instead (see the orchestrator section).
 3. Final render: edit the message with the complete reply (if it changed), or — for
    a short response that never triggered a flush — send it as a single fresh
    message. `room.typing_notice(false)`.
 
-If the stream errors or yields no content (e.g. a backend without SSE support),
-the handler falls back to a single non-streaming `chat()` call. Only the `content`
-field is surfaced — reasoning-model `reasoning` deltas are ignored. Slash commands
-reply directly with a single message (no streaming, no placeholder).
+If the producer errors or yields no content, the handler falls back to a single
+non-streaming `chat()` call. Slash commands reply directly with a single message
+(no streaming, no placeholder).
 
 ## Audio pipeline
 

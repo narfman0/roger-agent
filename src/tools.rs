@@ -99,10 +99,6 @@ pub struct ToolExecutor {
 }
 
 impl ToolExecutor {
-    pub fn new(searxng_url: Option<String>) -> Self {
-        Self::with_projects(searxng_url, HashMap::new(), None)
-    }
-
     pub fn with_projects(
         searxng_url: Option<String>,
         projects: HashMap<String, String>,

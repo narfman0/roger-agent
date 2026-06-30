@@ -351,17 +351,6 @@ impl Backend {
         }
     }
 
-    pub async fn chat_stream(
-        &self,
-        messages: &[ChatMessage],
-        tx: mpsc::Sender<String>,
-    ) -> Result<String> {
-        match self {
-            Backend::Http(c) => c.chat_stream(messages, tx).await,
-            Backend::Subprocess(s) => s.chat_stream(messages, tx).await,
-        }
-    }
-
     pub async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -428,24 +417,6 @@ impl ProfileLlm {
                 Ok(text) => return Ok(text),
                 Err(e) => {
                     warn!(model = %c.model(), "backend {} failed: {}", i, e);
-                    last_err = Some(e);
-                }
-            }
-        }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no backends configured")))
-    }
-
-    pub async fn chat_stream(
-        &self,
-        messages: &[ChatMessage],
-        tx: mpsc::Sender<String>,
-    ) -> Result<String> {
-        let mut last_err = None;
-        for (i, c) in self.clients.iter().enumerate() {
-            match c.chat_stream(messages, tx.clone()).await {
-                Ok(text) => return Ok(text),
-                Err(e) => {
-                    warn!(model = %c.model(), "streaming backend {} failed: {}", i, e);
                     last_err = Some(e);
                 }
             }
@@ -541,7 +512,7 @@ mod tests {
     async fn profile_llm_errors_when_all_backends_fail() {
         let p = ProfileLlm::new(vec![dead_client("primary"), dead_client("backup")]);
         let (tx, _rx) = mpsc::channel(8);
-        assert!(p.chat_stream(&[ChatMessage::user("hi")], tx).await.is_err());
+        assert!(p.chat_with_tools(&[ChatMessage::user("hi")], None, tx).await.is_err());
         assert!(p.chat(&[ChatMessage::user("hi")]).await.is_err());
     }
 

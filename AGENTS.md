@@ -38,37 +38,43 @@ Copy `.env.example` (or see README) and `config/backends.example.toml` to `confi
 RUST_LOG=roger=info ./target/debug/roger
 ```
 
-State is stored in `roger_session/`: SQLite crypto store, `session.json` (Matrix tokens), `history/` (per-room JSON), `logs/` (daily-rotated JSON logs).
+State lives in `ROGER_STATE_DIR` (default `~/.roger`), **not** the repo: SQLite
+crypto store, `session.json` (Matrix tokens), `history/` (per-room JSON), `logs/`
+(daily-rotated JSON). The working directory only needs `config/`. Agentic jobs run
+in a separate project directory, never roger's state or repo.
 
 ## Hot-reload
 
-`SIGHUP` reloads `config/` live (LLM client, system prompt, per-room settings) via
-`Arc<RwLock<ReloadableState>>` — no Matrix re-login. `kill -HUP <pid>` or
-`systemctl --user reload roger`. Credentials, homeserver, and room allowlist need a
-restart. See `docs/architecture.md` → Config hot-reload.
+`SIGHUP` reloads `config/` live (LLM clients, system prompt, per-room settings,
+comms config) via `Arc<RwLock<ReloadableState>>` — no Matrix re-login. `kill -HUP
+<pid>` or `systemctl --user reload roger`. Credentials, homeserver, room allowlist,
+and the subprocess concurrency cap need a restart. See `docs/architecture.md` →
+Config hot-reload.
 
 ## Logging
 
 `init_logging` (`src/main.rs`): human-readable to stderr + JSON daily-rotated to
-`ROGER_LOG_DIR` (default `roger_session/logs/`). `RUST_LOG` gates both.
+`ROGER_LOG_DIR` (default `<state dir>/logs/`). `RUST_LOG` gates both.
 
 ## Config
 
-- `config/profiles.toml` — committed, defines LLM profiles and routing
-- `config/backends.<HOST_ROLE>.toml` — **gitignored**, backend URLs + api_key_env names
-- `.env` — **gitignored**, Matrix credentials + GATEWAY_VKEY
+- `config/profiles.toml` — committed: LLM profiles, comms budgets, projects, rooms
+- `config/backends.<HOST_ROLE>.toml` — **gitignored**: backend kinds, URLs, api_key_env names
+- `.env` — **gitignored**: Matrix credentials + gateway key
 
 Never commit `.env` or `backends.*.toml` (except `backends.example.toml`).
 
 ## Message / streaming flow
 
-1. Typing indicator sent (no placeholder message)
-2. Response is streamed; flushed (first post, then in-place `m.replace` edits) on
-   sentence boundaries or a 1s ceiling, whichever first, never faster than 250ms.
-   Short replies are sent as a single message.
-3. See `docs/architecture.md` → Response UX for the full flow (fallback, slash
-   commands, token budgeting).
+1. Typing indicator sent (no placeholder for sync; async jobs post a "Working…" anchor).
+2. The response pipeline runs as one self-contained task; the handler awaits it
+   (sync), detaches it (async), or promotes it past the sync budget (auto). Output
+   is flushed (first post, then in-place `m.replace` edits) on sentence boundaries
+   or a debounce ceiling.
+3. See `docs/architecture.md` → Response UX and Orchestrator for the full flow.
 
 ## Adding a new backend kind
 
-Add a variant to `BackendKind` in `src/config.rs` (kebab-case serde name), then handle it in the dispatch logic.
+Add a variant to `BackendKind` in `src/config.rs` (kebab-case serde name), then
+handle it in `Config::build_client` (→ `llm::Backend`); for a subprocess kind, add
+its arg-building and output parser in `src/subprocess.rs`.
