@@ -1,7 +1,7 @@
 [profiles.chat]
 backend = "local-small"
 # Tried in order if the primary backend is unreachable/errors. cloud-fast routes
-# to Anthropic via the LiteLLM gateway, so chat keeps working if LM Studio is down.
+# to Anthropic via the LiteLLM gateway, so chat keeps working if Ollama is down.
 fallback = ["cloud-fast"]
 temperature = 0.7
 max_tokens = 1024
@@ -22,8 +22,8 @@ latency_class = "slow"
 idle_timeout_ms = 180000
 
 [profiles.reason]
-backend = "local-small"      # gemma (local)
-fallback = ["cloud-heavy"]   # opus (via gateway) when gemma is unavailable
+backend = "local-small"      # gemma via Ollama (local)
+fallback = ["cloud-heavy"]   # opus (via gateway) when Ollama is unavailable
 comms = "auto"
 latency_class = "fast"
 

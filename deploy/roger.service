@@ -1,6 +1,6 @@
 [Unit]
 Description=Roger Matrix Bot
-After=network.target lmstudio-server.service
+After=network.target
 
 [Service]
 WorkingDirectory=%h/.openclaw/workspace/roger

@@ -1,6 +1,6 @@
 # Deploy
 
-Systemd user units for running Roger and LM Studio on the `ai` machine.
+Systemd user unit for running Roger on the `ai` machine.
 
 ## Install
 
@@ -9,18 +9,17 @@ Systemd user units for running Roger and LM Studio on the `ai` machine.
 cd ~/.openclaw/workspace/roger
 cargo build --release
 
-# Copy units
+# Copy unit
 mkdir -p ~/.config/systemd/user
-cp deploy/lmstudio-server.service ~/.config/systemd/user/
 cp deploy/roger.service ~/.config/systemd/user/
 
 # Enable and start
 systemctl --user daemon-reload
-systemctl --user enable lmstudio-server roger
-systemctl --user start lmstudio-server roger
+systemctl --user enable roger
+systemctl --user start roger
 
 # Check status
-systemctl --user status lmstudio-server roger
+systemctl --user status roger
 journalctl --user -u roger -f
 ```
 
