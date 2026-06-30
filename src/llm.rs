@@ -240,8 +240,13 @@ impl LlmClient {
             }
         }
 
-        // Fallback: stream without tools from the accumulated conversation
-        self.chat_stream_raw(msg_values, tx).await
+        // Fallback: non-streaming call with the accumulated tool context.
+        // We use non-streaming here so the handler receives exactly one complete
+        // message (no intermediate streaming edits), which prevents Matrix clients
+        // from showing multiple near-identical messages during a long tool-call response.
+        let result = self.chat_raw(msg_values, false).await?;
+        let _ = tx.send(result.clone()).await;
+        Ok(result)
     }
 
     /// Stream a chat completion. The accumulated response text is sent on `tx`
