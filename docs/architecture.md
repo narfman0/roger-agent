@@ -45,9 +45,9 @@ For every response:
    edits it in place via `m.replace`) on a **sentence boundary** or once the flush
    ceiling passes — whichever first — but never faster than the rate floor. The
    flush decision is `should_flush()`; the cadence comes from
-   `CommsConfig::edit_debounce_ms` (`FlushCadence`). There is no placeholder for
-   sync turns — the typing indicator covers the wait; async/promoted jobs post a
-   "🛠️ Working…" anchor instead (see the orchestrator section).
+   `CommsConfig::edit_debounce_ms` (`FlushCadence`). There is no placeholder in any
+   mode — the typing indicator is the only "working" signal until the first content
+   flush posts the message.
 3. Final render: edit the message with the complete reply (if it changed), or — for
    a short response that never triggered a flush — send it as a single fresh
    message. `room.typing_notice(false)`.
@@ -182,11 +182,15 @@ history append → final render) runs as **one self-contained task**
 (`run_response_job`), so it is correct whether the handler awaits or detaches it.
 Each profile has a `comms` mode (`ReloadableState::comms_mode_for_profile`):
 
-- `sync` — handler awaits the task (today's UX: typing indicator, streamed edits).
-- `async` — the task posts a "🛠️ Working…" anchor, the handler registers it and
-  returns; it streams edits into that anchor while the user keeps chatting.
+- `sync` — handler awaits the task (typing indicator, streamed edits).
+- `async` — the handler registers the task and returns immediately; it streams its
+  reply into a message (posted on the first content flush) while the user keeps
+  chatting.
 - `auto` — `select!` the task against `sleep(sync_budget_ms)`; if the budget fires
-  first, post a "still working" note and let the task finish in the background.
+  first, detach silently and let the task finish in the background.
+
+No mode posts a placeholder — the Matrix typing indicator is the only "working"
+signal until the response message appears.
 
 Background jobs live in a `Workers` registry (`src/workers.rs`) in `BotCtx`: a
 job id → handle map with abort handles. It powers `/status` (active count),

@@ -39,9 +39,8 @@ use tracing::{info, warn};
 /// Streaming flush cadence, derived from `CommsConfig::edit_debounce_ms`. We
 /// post/update the response when a sentence completes OR `max_wait` has passed
 /// since the last update (whichever first), but never more often than `min_gap`.
-/// The typing indicator covers the gap before the first flush, so there's no
-/// placeholder message (except in async/promoted jobs, which post a "Working…"
-/// anchor up front).
+/// The typing indicator covers the gap before the first flush — no placeholder
+/// message in any mode.
 #[derive(Clone, Copy)]
 struct FlushCadence {
     min_gap: Duration,
@@ -56,9 +55,6 @@ impl FlushCadence {
         FlushCadence { min_gap, max_wait }
     }
 }
-
-/// Placeholder shown by async / auto-promoted jobs before the first content flush.
-const WORKING_ANCHOR: &str = "🛠️ Working…";
 
 /// Byte index of the last sentence-ending boundary in `s` (`.`, `!`, `?`, or a
 /// newline), if any.
@@ -299,14 +295,13 @@ pub async fn handle_message(
         .or_else(|| comms_cfg.default_workdir.as_deref().map(crate::config::expand_tilde));
 
     let flush = FlushCadence::from_comms(&comms_cfg);
-    // Async jobs post a "Working…" anchor up front; sync/auto rely on the typing
-    // indicator until the first content flush.
-    let ack_first = matches!(comms_mode, CommsMode::Async);
 
     // The whole response pipeline runs as one self-contained task (produce →
     // stream → fallback → metrics → history → final render). The handler then
     // either awaits it (sync), detaches it (async), or races it against the sync
-    // budget and promotes it to the background on timeout (auto).
+    // budget and promotes it to the background on timeout (auto). In every mode
+    // the typing indicator is the only "working" signal — no placeholder message;
+    // the response message appears on the first content flush.
     let job_id = ctx.workers.insert_pending(JobHandle {
         room: room_id.clone(),
         profile: profile.clone(),
@@ -320,10 +315,8 @@ pub async fn handle_message(
     let job = {
         let room = room.clone();
         tokio::spawn(async move {
-            run_response_job(
-                room, room_id, messages, llm, bot, profile, model, flush, ack_first, workdir,
-            )
-            .await;
+            run_response_job(room, room_id, messages, llm, bot, profile, model, flush, workdir)
+                .await;
             workers.remove(job_id);
         })
     };
@@ -336,18 +329,13 @@ pub async fn handle_message(
             let _ = job.await;
         }
         CommsMode::Auto => {
+            // Await up to the sync budget; if it runs long, detach silently and let
+            // the job finish in the background (typing indicator covers the wait).
             let sync_budget = Duration::from_millis(comms_cfg.sync_budget_ms);
             tokio::pin!(job);
             tokio::select! {
                 _ = &mut job => {}
-                _ = sleep(sync_budget) => {
-                    // Promote to background; the job keeps streaming into its message.
-                    let _ = room
-                        .send(RoomMessageEventContent::text_plain(
-                            "⏳ Still working on this — I'll update the message here when it's ready.",
-                        ))
-                        .await;
-                }
+                _ = sleep(sync_budget) => {}
             }
         }
     }
@@ -368,7 +356,6 @@ async fn run_response_job(
     profile: String,
     model: String,
     flush: FlushCadence,
-    ack_first: bool,
     workdir: Option<PathBuf>,
 ) {
     let _ = room.typing_notice(true).await;
@@ -396,20 +383,10 @@ async fn run_response_job(
         })
     };
 
-    // For async jobs, post a placeholder anchor immediately so the user sees the
-    // job started; content flushes then edit it in place.
+    // No placeholder: the first content flush posts the message; the typing
+    // indicator is the only "working" signal until then.
     let mut msg_id: Option<OwnedEventId> = None;
     let mut shown = String::new();
-    if ack_first {
-        if let Ok(resp) = room
-            .send(RoomMessageEventContent::text_plain(WORKING_ANCHOR))
-            .await
-        {
-            msg_id = Some(resp.event_id);
-            shown = WORKING_ANCHOR.to_string();
-        }
-    }
-
     let mut last_flush: Option<Instant> = None;
     while let Some(acc) = rx.recv().await {
         let elapsed = last_flush.unwrap_or(req_start).elapsed();

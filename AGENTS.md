@@ -66,7 +66,7 @@ Never commit `.env` or `backends.*.toml` (except `backends.example.toml`).
 
 ## Message / streaming flow
 
-1. Typing indicator sent (no placeholder for sync; async jobs post a "Working…" anchor).
+1. Typing indicator sent — the only "working" signal; no placeholder in any mode.
 2. The response pipeline runs as one self-contained task; the handler awaits it
    (sync), detaches it (async), or promotes it past the sync budget (auto). Output
    is flushed (first post, then in-place `m.replace` edits) on sentence boundaries

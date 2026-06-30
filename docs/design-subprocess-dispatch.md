@@ -197,13 +197,14 @@ job still persists its result and updates its message on completion.
 
 - **`sync`** — handler awaits the task to completion. Exactly today's UX (typing
   indicator, no placeholder, streamed edits).
-- **`async`** — the task posts an immediate "🛠️ Working…" message as its anchor,
-  the handler registers it and returns. The task streams edits into that anchor and
-  the user is free to send other messages meanwhile.
+- **`async`** — the handler registers the task and returns immediately. The task
+  streams its reply into a message (posted on the first content flush) and the user
+  is free to send other messages meanwhile.
 - **`auto`** — `tokio::select!` the task against a `sleep(sync_budget_ms)` (7s):
   - task finishes first → sync UX, nothing detached.
-  - budget fires first → **promote**: post a "still working — I'll update here"
-    note, register the task, return. The task keeps streaming edits.
+  - budget fires first → **promote**: register the task and return; it finishes in
+    the background. The typing indicator (not a placeholder message) is the only
+    "working" signal until the response appears.
 
 `code` is `async` (expects minutes); `reason` is `auto` (usually fast, occasionally
 long); `chat`/`fast` are `sync`.
