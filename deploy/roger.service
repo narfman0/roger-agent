@@ -1,0 +1,13 @@
+[Unit]
+Description=Roger Matrix Bot
+After=network.target lmstudio-server.service
+
+[Service]
+WorkingDirectory=%h/.openclaw/workspace/roger
+ExecStart=%h/.openclaw/workspace/roger/target/release/roger
+EnvironmentFile=%h/.openclaw/workspace/roger/.env
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

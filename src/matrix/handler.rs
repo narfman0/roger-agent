@@ -17,7 +17,7 @@ use matrix_sdk::{
     },
     Client,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 use tracing::{info, warn};
 
 #[derive(Clone)]
@@ -29,6 +29,8 @@ pub struct BotCtx {
     pub llm: Arc<LlmClient>,
     pub speaches: Option<Arc<SpeachesClient>>,
     pub history: Arc<HistoryStore>,
+    pub system_prompt: String,
+    pub started_at: Arc<Instant>,
 }
 
 impl BotCtx {
@@ -118,6 +120,20 @@ pub async fn handle_message(
 
     info!(room = %room_id, sender = %event.sender, "processing: {}", body);
 
+    // Handle slash commands without touching the LLM
+    if let Some(cmd_reply) = handle_slash_command(&body, &room_id, &ctx) {
+        let _ = room.typing_notice(true).await;
+        let ack_id = match room.send(RoomMessageEventContent::text_plain("…")).await {
+            Ok(resp) => resp.event_id,
+            Err(e) => { warn!("failed to send cmd ack: {}", e); return; }
+        };
+        let _ = room.typing_notice(false).await;
+        let edited = RoomMessageEventContent::text_plain(&cmd_reply)
+            .make_replacement(ReplacementMetadata::new(ack_id, None), None);
+        let _ = room.send(edited).await;
+        return;
+    }
+
     // Send typing indicator
     let _ = room.typing_notice(true).await;
 
@@ -134,11 +150,12 @@ pub async fn handle_message(
         }
     };
 
-    // Record user message and build context window
+    // Build context: system prompt + history + current message
     if let Err(e) = ctx.history.append(&room_id, ChatMessage::user(&body)) {
         warn!("failed to save user message to history: {}", e);
     }
-    let messages = ctx.history.windowed(&room_id, 20);
+    let mut messages = vec![ChatMessage::system(&ctx.system_prompt)];
+    messages.extend(ctx.history.windowed(&room_id, 20));
 
     // Call LLM with full room history
     let result = ctx.llm.chat(&messages).await;
@@ -165,6 +182,44 @@ pub async fn handle_message(
                 .make_replacement(ReplacementMetadata::new(ack_id, None), None);
             let _ = room.send(edited).await;
         }
+    }
+}
+
+/// Returns Some(reply) if the message is a slash command, None otherwise.
+fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option<String> {
+    let trimmed = body.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
+    let cmd = parts[0].to_lowercase();
+
+    match cmd.as_str() {
+        "/help" => Some(
+            "**Roger commands**\n\
+             `/help` — show this list\n\
+             `/clear` — wipe conversation history for this room\n\
+             `/status` — show uptime, model, and history stats"
+                .to_string(),
+        ),
+        "/clear" => {
+            if let Err(e) = ctx.history.clear(room_id) {
+                Some(format!("Failed to clear history: {}", e))
+            } else {
+                Some("History cleared.".to_string())
+            }
+        }
+        "/status" => {
+            let uptime = ctx.started_at.elapsed();
+            let secs = uptime.as_secs();
+            let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+            let history_len = ctx.history.windowed(room_id, 100).len();
+            Some(format!(
+                "**Roger status**\nUptime: {}h {}m {}s\nHistory: {} messages (this room)",
+                h, m, s, history_len
+            ))
+        }
+        _ => Some(format!("Unknown command `{}`. Try `/help`.", parts[0])),
     }
 }
 

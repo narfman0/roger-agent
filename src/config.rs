@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::Path;
+use chrono::Local;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -169,6 +170,8 @@ pub struct Config {
     pub room_allowlist: Vec<String>,
     /// URL for the Whisper-compatible transcription service (e.g. speaches)
     pub speaches_url: Option<String>,
+    /// System prompt injected as the first message in every LLM call
+    pub system_prompt: String,
 }
 
 impl Config {
@@ -204,6 +207,13 @@ impl Config {
 
         let speaches_url = env::var("SPEACHES_URL").ok();
 
+        // Load system prompt from file, inject current date
+        let prompt_path = config_dir.join("system_prompt.txt");
+        let raw_prompt = fs::read_to_string(&prompt_path).unwrap_or_else(|_| {
+            "You are Roger, a helpful Matrix-native AI assistant.".to_string()
+        });
+        let system_prompt = raw_prompt.replace("{date}", &Local::now().format("%Y-%m-%d").to_string());
+
         Ok(Config {
             profiles: profiles_file.profiles,
             backends: backends_file.backends,
@@ -217,6 +227,7 @@ impl Config {
             matrix_password,
             room_allowlist,
             speaches_url,
+            system_prompt,
         })
     }
 

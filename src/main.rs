@@ -10,6 +10,7 @@ use matrix_sdk::config::SyncSettings;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::info;
 
 use crate::matrix::handler::BotCtx;
@@ -83,6 +84,8 @@ async fn main() -> Result<()> {
         llm,
         speaches,
         history,
+        system_prompt: cfg.system_prompt,
+        started_at: Arc::new(Instant::now()),
     };
 
     client.add_event_handler_context(bot_ctx);
