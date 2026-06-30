@@ -1,18 +1,22 @@
 use crate::history::ChatMessage;
+use crate::tools::{tool_definitions, ToolCall, ToolExecutor};
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
-    messages: &'a [ChatMessage],
+    messages: Vec<Value>,
     max_tokens: u32,
     temperature: f32,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,11 +27,16 @@ struct ChatResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: AssistantMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AssistantMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 // --- Streaming (Server-Sent Events) response shapes ---
@@ -102,7 +111,18 @@ impl LlmClient {
         (self.context_tokens as usize).saturating_sub(reserved).max(256)
     }
 
+    fn messages_to_json(messages: &[ChatMessage]) -> Vec<Value> {
+        messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .collect()
+    }
+
     pub async fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
+        self.chat_raw(Self::messages_to_json(messages), false).await
+    }
+
+    async fn chat_raw(&self, messages: Vec<Value>, with_tools: bool) -> Result<String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         let body = ChatRequest {
@@ -111,10 +131,10 @@ impl LlmClient {
             max_tokens: self.max_tokens,
             temperature: self.temperature,
             stream: false,
+            tools: if with_tools { Some(tool_definitions()) } else { None },
         };
 
         let mut req = self.http.post(&url).json(&body);
-
         if let Some(key) = &self.api_key {
             if !key.is_empty() {
                 req = req.bearer_auth(key);
@@ -133,10 +153,95 @@ impl LlmClient {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .and_then(|c| c.message.content)
             .unwrap_or_else(|| "(no response)".to_string());
 
         Ok(content)
+    }
+
+    /// Run the tool-use loop: call the LLM with tools enabled, execute any tool
+    /// calls, append results, repeat — then stream the final text answer.
+    /// Falls back to a plain streaming call when no executor is provided.
+    pub async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        executor: Option<&ToolExecutor>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<String> {
+        let Some(exec) = executor else {
+            return self.chat_stream(messages, tx).await;
+        };
+
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let mut msg_values: Vec<Value> = Self::messages_to_json(messages);
+        const MAX_TOOL_ROUNDS: usize = 5;
+
+        for round in 0..MAX_TOOL_ROUNDS {
+            let body = ChatRequest {
+                model: &self.model,
+                messages: msg_values.clone(),
+                max_tokens: self.max_tokens,
+                temperature: self.temperature,
+                stream: false,
+                tools: Some(tool_definitions()),
+            };
+
+            let mut req = self.http.post(&url).json(&body);
+            if let Some(key) = &self.api_key {
+                if !key.is_empty() {
+                    req = req.bearer_auth(key);
+                }
+            }
+
+            let resp = req.send().await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("LLM request failed {}: {}", status, text);
+            }
+
+            let chat_resp: ChatResponse = resp.json().await?;
+            let choice = chat_resp.choices.into_iter().next()
+                .ok_or_else(|| anyhow::anyhow!("empty choices"))?;
+
+            let finish = choice.finish_reason.as_deref().unwrap_or("");
+
+            if finish != "tool_calls" || choice.message.tool_calls.is_none() {
+                // Final answer — stream it
+                let final_text = choice.message.content.unwrap_or_default();
+                if !final_text.is_empty() {
+                    let _ = tx.send(final_text.clone()).await;
+                    return Ok(final_text);
+                }
+                // Empty content and no tool calls — fall through to streaming
+                break;
+            }
+
+            // Execute tool calls and append results
+            let tool_calls = choice.message.tool_calls.unwrap();
+            info!("tool round {}: {} call(s)", round + 1, tool_calls.len());
+
+            // Append assistant message with tool_calls
+            msg_values.push(serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": tool_calls
+            }));
+
+            // Execute each tool and append its result
+            for call in &tool_calls {
+                let result = exec.execute(call).await;
+                info!(tool = %call.function.name, "result length: {}", result.len());
+                msg_values.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": result
+                }));
+            }
+        }
+
+        // Fallback: stream without tools from the accumulated conversation
+        self.chat_stream_raw(msg_values, tx).await
     }
 
     /// Stream a chat completion. The accumulated response text is sent on `tx`
@@ -145,6 +250,14 @@ impl LlmClient {
     pub async fn chat_stream(
         &self,
         messages: &[ChatMessage],
+        tx: mpsc::Sender<String>,
+    ) -> Result<String> {
+        self.chat_stream_raw(Self::messages_to_json(messages), tx).await
+    }
+
+    async fn chat_stream_raw(
+        &self,
+        messages: Vec<Value>,
         tx: mpsc::Sender<String>,
     ) -> Result<String> {
         use futures_util::StreamExt;
@@ -156,6 +269,7 @@ impl LlmClient {
             max_tokens: self.max_tokens,
             temperature: self.temperature,
             stream: true,
+            tools: None,
         };
 
         let mut req = self.http.post(&url).json(&body);
@@ -258,6 +372,25 @@ impl ProfileLlm {
                 Ok(text) => return Ok(text),
                 Err(e) => {
                     warn!(model = %c.model(), "streaming backend {} failed: {}", i, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no backends configured")))
+    }
+
+    pub async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        executor: Option<&ToolExecutor>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<String> {
+        let mut last_err = None;
+        for (i, c) in self.clients.iter().enumerate() {
+            match c.chat_with_tools(messages, executor, tx.clone()).await {
+                Ok(text) => return Ok(text),
+                Err(e) => {
+                    warn!(model = %c.model(), "tool-call backend {} failed: {}", i, e);
                     last_err = Some(e);
                 }
             }

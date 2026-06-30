@@ -6,6 +6,7 @@ mod llm;
 mod matrix;
 mod metrics;
 mod room_profiles;
+mod tools;
 
 use anyhow::Result;
 use matrix_sdk::config::SyncSettings;
@@ -113,6 +114,14 @@ async fn main() -> Result<()> {
         Arc::new(audio::SpeachesClient::new(url.clone()))
     });
 
+    // Build tool executor (web_search, web_fetch)
+    let tool_executor = Arc::new(tools::ToolExecutor::new(cfg.searxng_url.clone()));
+    if let Some(url) = &cfg.searxng_url {
+        info!("searxng: {} (web_search enabled)", url);
+    } else {
+        info!("SEARXNG_URL not set — web_search will return an error when called");
+    }
+
     let session_dir = PathBuf::from("roger_session");
     let client = matrix::client::build_client(&cfg.matrix_homeserver, &session_dir).await?;
     matrix::client::login(&client, &cfg.matrix_user, &cfg.matrix_password, &session_dir).await?;
@@ -171,6 +180,7 @@ async fn main() -> Result<()> {
         state,
         room_profiles: room_profile_store,
         metrics: Arc::new(metrics::Metrics::default()),
+        tool_executor,
     };
 
     client.add_event_handler_context(bot_ctx);

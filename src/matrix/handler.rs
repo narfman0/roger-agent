@@ -5,6 +5,7 @@ use crate::{
     llm::ProfileLlm,
     metrics::Metrics,
     room_profiles::RoomProfileStore,
+    tools::ToolExecutor,
 };
 use matrix_sdk::{
     event_handler::Ctx,
@@ -116,6 +117,8 @@ pub struct BotCtx {
     pub room_profiles: Arc<RoomProfileStore>,
     /// Process-lifetime response counters.
     pub metrics: Arc<Metrics>,
+    /// Tool executor for web_search / web_fetch.
+    pub tool_executor: Arc<ToolExecutor>,
 }
 
 impl BotCtx {
@@ -247,7 +250,8 @@ pub async fn handle_message(
     let stream_handle = {
         let llm = llm.clone();
         let messages = messages.clone();
-        tokio::spawn(async move { llm.chat_stream(&messages, tx).await })
+        let executor = ctx.tool_executor.clone();
+        tokio::spawn(async move { llm.chat_with_tools(&messages, Some(&executor), tx).await })
     };
 
     let min_gap = Duration::from_millis(MIN_FLUSH_GAP_MS);

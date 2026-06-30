@@ -198,6 +198,8 @@ pub struct Config {
     pub speaches_url: Option<String>,
     /// System prompt injected as the first message in every LLM call
     pub system_prompt: String,
+    /// Base URL for the SearXNG instance used by the web_search tool
+    pub searxng_url: Option<String>,
 }
 
 impl Config {
@@ -232,6 +234,7 @@ impl Config {
             .collect();
 
         let speaches_url = env::var("SPEACHES_URL").ok();
+        let searxng_url = env::var("SEARXNG_URL").ok();
 
         // Load system prompt from file, inject current date
         let prompt_path = config_dir.join("system_prompt.txt");
@@ -260,6 +263,7 @@ impl Config {
             room_allowlist,
             speaches_url,
             system_prompt,
+            searxng_url,
         })
     }
 
