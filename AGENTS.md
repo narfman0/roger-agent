@@ -2,6 +2,11 @@
 
 Rust Matrix bot that responds to messages in allowlisted rooms using configurable LLM backends.
 
+## Workflow
+
+Commit directly on `master` and keep going — no feature branches or PRs unless
+asked. Build + test before each commit. Push when a unit of work is done.
+
 ## Key source files
 
 | File | Purpose |
