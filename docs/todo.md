@@ -87,12 +87,32 @@ JSON with daily rotation to `ROGER_LOG_DIR` (default `roger_session/logs/`, file
 held for the process lifetime so logs flush on shutdown. `RUST_LOG` controls both
 sinks.
 
-## Phase 3 (next)
+---
 
-Roadmap candidates — not yet started:
-- Profile routing: pick LLM profile per task (`code`/`reason`/`research`) instead of always `chat`
-- Streaming responses: edit the ack incrementally as tokens arrive (debounced)
-- `/model <profile>` command to switch a room's backend at runtime
-- Token/context budgeting: summarize or trim history beyond a token threshold
-- Multi-backend dispatch: implement the reserved `claude-code` / `open-code` subprocess kinds
-- Metrics: request counts, latency, error rate (Prometheus endpoint or structured log scrape)
+# Phase 3
+
+## Goals
+
+Smarter routing and richer responses: per-room model selection, runtime switching,
+better context handling, streaming, and observability.
+
+## Tasks
+
+| # | Task | Status |
+|---|------|--------|
+| 1 | Profile routing (per-room profile → LLM client) | ✅ Done |
+| 2 | `/model <profile>` runtime per-room switch | ⏳ |
+| 3 | History token budgeting | ⏳ |
+| 4 | Streaming responses (debounced ack edits) | ⏳ |
+| 5 | Metrics: request counts, latency, error rate | ⏳ |
+| 6 | Multi-backend dispatch: `claude-code` / `open-code` subprocess kinds | 📋 deferred |
+
+## Completed
+
+### Profile routing (#1)
+`ReloadableState` now holds an `LlmClient` per profile (`llms` map), built from all
+`[profiles.*]` at startup/reload (unbuildable profiles skipped with a warning;
+`chat` required). `RoomConfig` gained a `profile` field. `llm_for_room` resolves
+runtime override → room config → `chat`, falling back to `chat` if the chosen
+profile has no client. `/status` shows the resolved profile and model. See
+`docs/architecture.md` → Profile routing.

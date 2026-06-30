@@ -53,6 +53,11 @@ impl LlmClient {
         }
     }
 
+    /// The model name this client sends requests for.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     pub async fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 

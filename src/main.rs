@@ -7,7 +7,7 @@ mod matrix;
 
 use anyhow::Result;
 use matrix_sdk::config::SyncSettings;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -63,19 +63,25 @@ async fn reload_on_sighup(config_dir: PathBuf, state: Arc<RwLock<ReloadableState
                 continue;
             }
         };
-        let (llm, model_name) = match cfg.build_chat_llm() {
+        let llms = match cfg.build_all_llms() {
             Ok(v) => v,
             Err(e) => {
-                warn!("config reload failed building LLM (keeping current config): {}", e);
+                warn!("config reload failed building LLMs (keeping current config): {}", e);
                 continue;
             }
         };
         let mut st = state.write().await;
-        st.llm = Arc::new(llm);
-        st.model_name = model_name;
+        st.llms = llms.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
         st.system_prompt = cfg.system_prompt;
         st.room_configs = cfg.rooms;
-        info!("config reloaded — model: {}, rooms: {}", st.model_name, st.room_configs.len());
+        // Drop runtime /model overrides that point at a profile that no longer builds.
+        let valid: HashSet<String> = st.llms.keys().cloned().collect();
+        st.room_profiles.retain(|_, profile| valid.contains(profile));
+        info!(
+            "config reloaded — profiles: {}, rooms: {}",
+            st.llms.len(),
+            st.room_configs.len()
+        );
     }
 }
 
@@ -89,9 +95,15 @@ async fn main() -> Result<()> {
     info!("roger starting — homeserver: {}", cfg.matrix_homeserver);
     info!("allowlist: {:?}", cfg.room_allowlist);
 
-    // Build LLM client from the "chat" profile
-    let (llm, model_name) = cfg.build_chat_llm()?;
-    info!("LLM: {} @ {}", model_name, cfg.backend_for_profile("chat")?.base_url);
+    // Build an LLM client per profile (chat required; others skipped if unbuildable)
+    let llms: HashMap<String, Arc<llm::LlmClient>> = cfg
+        .build_all_llms()?
+        .into_iter()
+        .map(|(k, v)| (k, Arc::new(v)))
+        .collect();
+    for (name, client) in &llms {
+        info!("profile '{}' → model {}", name, client.model());
+    }
 
     // Build speaches client if configured
     let speaches = cfg.speaches_url.as_ref().map(|url| {
@@ -128,10 +140,10 @@ async fn main() -> Result<()> {
     info!("history store initialized");
 
     let state = Arc::new(RwLock::new(ReloadableState {
-        llm: Arc::new(llm),
-        model_name,
+        llms,
         system_prompt: cfg.system_prompt,
         room_configs: cfg.rooms,
+        room_profiles: HashMap::new(),
     }));
 
     // Spawn the SIGHUP hot-reload listener

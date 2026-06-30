@@ -135,13 +135,22 @@ pub struct RoomConfig {
     /// system prompt for this room. Supports the `{date}` placeholder.
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Optional LLM profile name for this room (e.g. "chat", "reason", "code").
+    /// Defaults to "chat" when unset. Overridable at runtime via `/model`.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 fn default_require_mention() -> bool { true }
 
 impl Default for RoomConfig {
     fn default() -> Self {
-        RoomConfig { name: String::new(), require_mention: true, system_prompt: None }
+        RoomConfig {
+            name: String::new(),
+            require_mention: true,
+            system_prompt: None,
+            profile: None,
+        }
     }
 }
 
@@ -253,24 +262,42 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("unknown backend '{}' for profile '{}'", p.backend, profile))
     }
 
-    /// Build the LLM client for the "chat" profile. Returns the client and the
-    /// resolved model name. Shared by startup and config hot-reload.
-    pub fn build_chat_llm(&self) -> anyhow::Result<(crate::llm::LlmClient, String)> {
-        let backend = self.backend_for_profile("chat")?;
-        let profile = self.profiles.get("chat")
-            .ok_or_else(|| anyhow::anyhow!("chat profile required"))?;
+    /// Build the LLM client for a single named profile.
+    pub fn build_llm_for_profile(&self, profile_name: &str) -> anyhow::Result<crate::llm::LlmClient> {
+        let backend = self.backend_for_profile(profile_name)?;
+        let profile = self.profiles.get(profile_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown profile: {}", profile_name))?;
         let base_url = format!(
             "{}/v1",
             backend.base_url.trim_end_matches('/').trim_end_matches("/v1")
         );
-        let llm = crate::llm::LlmClient::new(
+        Ok(crate::llm::LlmClient::new(
             base_url,
             backend.model.clone(),
             backend.api_key(),
             profile.max_tokens.unwrap_or(1024),
             profile.temperature.unwrap_or(0.7),
-        );
-        Ok((llm, backend.model.clone()))
+        ))
+    }
+
+    /// Build an LLM client for every defined profile. Profiles that fail to build
+    /// (e.g. a backend missing on this host) are skipped with a warning rather
+    /// than aborting startup. The "chat" profile is required and must build.
+    /// Shared by startup and config hot-reload.
+    pub fn build_all_llms(&self) -> anyhow::Result<HashMap<String, crate::llm::LlmClient>> {
+        let mut clients = HashMap::new();
+        for name in self.profiles.keys() {
+            match self.build_llm_for_profile(name) {
+                Ok(client) => {
+                    clients.insert(name.clone(), client);
+                }
+                Err(e) => tracing::warn!("skipping profile '{}': {}", name, e),
+            }
+        }
+        if !clients.contains_key("chat") {
+            anyhow::bail!("the 'chat' profile is required but failed to build");
+        }
+        Ok(clients)
     }
 }
 

@@ -46,6 +46,21 @@ All cloud LLM calls go through a LiteLLM Docker container on `srv:4000`. This:
 - The `ai` machine uses a LiteLLM virtual key (`GATEWAY_VKEY`) with no direct Anthropic access
 - Lets backends be swapped without changing roger's config
 
+## Profile routing
+
+`ReloadableState` holds one `LlmClient` per profile (`llms: HashMap<profile, client>`),
+built from `profiles.toml` at startup and on reload. A profile that fails to build
+(e.g. its backend is missing on this host) is skipped with a warning; `chat` is
+required.
+
+Each room resolves to a profile via `ReloadableState::llm_for_room`:
+1. a runtime `/model` override (`room_profiles`), else
+2. the room's `profile` config field, else
+3. `chat`.
+
+If the resolved profile has no built client, it falls back to `chat`. The resolved
+profile + model are shown in `/status`.
+
 ## Config hot-reload
 
 Reloadable config lives behind `Arc<RwLock<ReloadableState>>` (in `matrix/handler.rs`),

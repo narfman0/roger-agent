@@ -25,10 +25,38 @@ use tracing::{info, warn};
 /// Everything reachable behind `BotCtx::state` is reloadable; fields directly on
 /// `BotCtx` are fixed for the process lifetime.
 pub struct ReloadableState {
-    pub llm: Arc<LlmClient>,
-    pub model_name: String,
+    /// LLM client per profile name (e.g. "chat", "reason", "code").
+    pub llms: HashMap<String, Arc<LlmClient>>,
     pub system_prompt: String,
     pub room_configs: HashMap<String, RoomConfig>,
+    /// Runtime per-room profile overrides set via `/model`, keyed by room id.
+    pub room_profiles: HashMap<String, String>,
+}
+
+impl ReloadableState {
+    /// The configured profile name for a room: runtime `/model` override, else
+    /// the room's `profile` config, else "chat".
+    pub fn profile_name_for_room(&self, room_id: &str) -> String {
+        if let Some(p) = self.room_profiles.get(room_id) {
+            return p.clone();
+        }
+        self.room_configs
+            .get(room_id)
+            .and_then(|r| r.profile.clone())
+            .unwrap_or_else(|| "chat".to_string())
+    }
+
+    /// Resolve the LLM client for a room. Returns the client and the profile
+    /// name actually used (falls back to "chat" if the requested profile has no
+    /// built client).
+    pub fn llm_for_room(&self, room_id: &str) -> (Arc<LlmClient>, String) {
+        let requested = self.profile_name_for_room(room_id);
+        if let Some(c) = self.llms.get(&requested) {
+            return (c.clone(), requested);
+        }
+        let chat = self.llms.get("chat").expect("chat client always present");
+        (chat.clone(), "chat".to_string())
+    }
 }
 
 #[derive(Clone)]
@@ -173,7 +201,8 @@ pub async fn handle_message(
             .get(&room_id)
             .and_then(|r| r.system_prompt.clone())
             .unwrap_or_else(|| st.system_prompt.clone());
-        (st.llm.clone(), prompt)
+        let (client, _profile) = st.llm_for_room(&room_id);
+        (client, prompt)
     };
     let mut messages = vec![ChatMessage::system(&system_prompt)];
     messages.extend(ctx.history.windowed(&room_id, 20));
@@ -235,10 +264,10 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
             let secs = uptime.as_secs();
             let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
             let history_len = ctx.history.windowed(room_id, 100).len();
-            let model_name = ctx.state.read().await.model_name.clone();
+            let (client, profile) = ctx.state.read().await.llm_for_room(room_id);
             Some(format!(
-                "**Roger status**\nUptime: {}h {}m {}s\nModel: {}\nHistory: {} messages (this room)",
-                h, m, s, model_name, history_len
+                "**Roger status**\nUptime: {}h {}m {}s\nProfile: {} ({})\nHistory: {} messages (this room)",
+                h, m, s, profile, client.model(), history_len
             ))
         }
         _ => Some(format!("Unknown command `{}`. Try `/help`.", parts[0])),
@@ -267,4 +296,77 @@ async fn transcribe_audio(
         .await?;
 
     speaches.transcribe(bytes, "audio.ogg").await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client(model: &str) -> Arc<LlmClient> {
+        Arc::new(LlmClient::new(
+            "http://localhost/v1".into(),
+            model.into(),
+            None,
+            128,
+            0.0,
+        ))
+    }
+
+    fn state() -> ReloadableState {
+        let mut llms = HashMap::new();
+        llms.insert("chat".to_string(), client("chat-model"));
+        llms.insert("reason".to_string(), client("reason-model"));
+        let mut room_configs = HashMap::new();
+        room_configs.insert(
+            "!coding:srv".to_string(),
+            RoomConfig {
+                name: "Coding".into(),
+                require_mention: true,
+                system_prompt: None,
+                profile: Some("reason".into()),
+            },
+        );
+        ReloadableState {
+            llms,
+            system_prompt: "sys".into(),
+            room_configs,
+            room_profiles: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn unconfigured_room_uses_chat() {
+        let st = state();
+        let (client, profile) = st.llm_for_room("!unknown:srv");
+        assert_eq!(profile, "chat");
+        assert_eq!(client.model(), "chat-model");
+    }
+
+    #[test]
+    fn room_config_profile_is_used() {
+        let st = state();
+        let (client, profile) = st.llm_for_room("!coding:srv");
+        assert_eq!(profile, "reason");
+        assert_eq!(client.model(), "reason-model");
+    }
+
+    #[test]
+    fn runtime_override_beats_room_config() {
+        let mut st = state();
+        st.room_profiles
+            .insert("!coding:srv".to_string(), "chat".to_string());
+        let (client, profile) = st.llm_for_room("!coding:srv");
+        assert_eq!(profile, "chat");
+        assert_eq!(client.model(), "chat-model");
+    }
+
+    #[test]
+    fn missing_profile_falls_back_to_chat() {
+        let mut st = state();
+        st.room_profiles
+            .insert("!coding:srv".to_string(), "nonexistent".to_string());
+        let (client, profile) = st.llm_for_room("!coding:srv");
+        assert_eq!(profile, "chat");
+        assert_eq!(client.model(), "chat-model");
+    }
 }

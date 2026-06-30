@@ -52,6 +52,9 @@ require_mention = false
 [rooms."!nogMOAyCJDGivqjSdK:matrix.blastedstudios.com"]
 name = "Roger Test - Coding"
 require_mention = true
+# Route this room to a different LLM profile (see [profiles.*] above).
+# Defaults to "chat" when unset; overridable live with `/model <profile>`.
+profile = "reason"
 system_prompt = """
 You are Roger in a coding room. Be terse and technical. Prefer code over prose.
 When asked for code, output a single fenced block with no preamble unless asked.
