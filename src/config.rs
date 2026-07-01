@@ -154,6 +154,10 @@ pub struct RoomConfig {
     /// Defaults to "chat" when unset. Overridable at runtime via `/model`.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Optional per-room operating-instructions file, appended after the global
+    /// `[context].operating_file`. `~` is expanded.
+    #[serde(default)]
+    pub operating_file: Option<String>,
 }
 
 fn default_require_mention() -> bool { true }
@@ -165,6 +169,7 @@ impl Default for RoomConfig {
             require_mention: true,
             system_prompt: None,
             profile: None,
+            operating_file: None,
         }
     }
 }
@@ -174,11 +179,45 @@ fn inject_date(s: &str) -> String {
     s.replace("{date}", &Local::now().format("%Y-%m-%d").to_string())
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Operating-instructions injection. The global file is layered into every room's
+/// system prompt; a per-room override (`RoomConfig::operating_file`) is appended.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ContextConfig {
+    #[serde(default)]
+    pub operating_file: Option<String>,
+}
+
+/// Durable-memory injection. A global file (shared across rooms) and a per-room
+/// file are read fresh each turn and layered into the system prompt.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Global memory file (`~` expanded). Defaults to `<state>/memory/global.md`
+    /// (resolved by `MemoryStore`) when unset.
+    #[serde(default)]
+    pub global_file: Option<String>,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        MemoryConfig { enabled: true, global_file: None }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ProfilesFile {
     profiles: HashMap<String, ProfileConfig>,
     #[serde(default)]
     comms: Option<CommsConfig>,
+    #[serde(default)]
+    context: Option<ContextConfig>,
+    #[serde(default)]
+    memory: Option<MemoryConfig>,
     #[serde(default)]
     rooms: HashMap<String, RoomConfig>,
     /// Known projects (name → path) the LLM can select via the `set_workdir` tool.
@@ -196,6 +235,8 @@ pub struct Config {
     pub profiles: HashMap<String, ProfileConfig>,
     pub backends: HashMap<String, BackendConfig>,
     pub comms: CommsConfig,
+    pub context: ContextConfig,
+    pub memory: MemoryConfig,
     pub rooms: HashMap<String, RoomConfig>,
     /// Known projects (name → path) selectable via the `set_workdir` tool.
     pub projects: HashMap<String, String>,
@@ -262,6 +303,8 @@ impl Config {
             profiles: profiles_file.profiles,
             backends: backends_file.backends,
             comms: profiles_file.comms.unwrap_or_default(),
+            context: profiles_file.context.unwrap_or_default(),
+            memory: profiles_file.memory.unwrap_or_default(),
             rooms,
             projects: profiles_file.projects,
             matrix_homeserver,

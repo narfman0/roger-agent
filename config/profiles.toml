@@ -40,6 +40,19 @@ comms = "async"
 idle_timeout_ms = 180000
 permission_mode = "bypassPermissions"
 
+# Operating instructions layered into every room's system prompt (read fresh each
+# turn — edits apply without a reload). A room may add its own via
+# [rooms.*].operating_file, appended after this global one.
+[context]
+operating_file = "config/operating.md"
+
+# Durable memory injected into the system prompt: a global file plus a per-room file
+# under ~/.roger/memory/. Written by compaction (a later task); set enabled = false
+# to turn injection off.
+[memory]
+enabled = true
+# global_file = "~/.roger/memory/global.md"   # default when unset
+
 # comms = sync | async | auto. sync awaits inline; async acks + runs in the
 # background; auto starts inline and promotes to background past sync_budget_ms.
 [comms]

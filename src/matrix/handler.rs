@@ -3,6 +3,7 @@ use crate::{
     config::{CommsConfig, CommsMode, RoomConfig},
     history::{ChatMessage, HistoryStore},
     llm::ProfileLlm,
+    memory::MemoryStore,
     metrics::Metrics,
     room_profiles::RoomProfileStore,
     room_workdirs::RoomWorkdirStore,
@@ -75,6 +76,43 @@ fn should_flush(
     changed && elapsed >= min_gap && (sentence_ready || elapsed >= max_wait)
 }
 
+/// Read a small context file (operating instructions), trimmed; empty if missing.
+/// `~` is expanded; relative paths resolve against the process working directory.
+fn read_context_file(path: &str) -> String {
+    let expanded = crate::config::expand_tilde(path);
+    std::fs::read_to_string(&expanded)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Layer operating instructions and durable memory onto the base persona to form
+/// the full system prompt. Empty sections are skipped, so absent files add nothing.
+fn assemble_system_prompt(
+    base: &str,
+    operating_global: &str,
+    operating_room: &str,
+    memory_global: &str,
+    memory_room: &str,
+) -> String {
+    let mut out = base.trim_end().to_string();
+    let mut section = |title: Option<&str>, body: &str| {
+        if body.is_empty() {
+            return;
+        }
+        out.push_str("\n\n");
+        if let Some(t) = title {
+            out.push_str(t);
+            out.push('\n');
+        }
+        out.push_str(body);
+    };
+    section(None, operating_global);
+    section(None, operating_room);
+    section(Some("## Memory (global)"), memory_global);
+    section(Some("## Memory (this room)"), memory_room);
+    out
+}
+
 /// Edit a previously sent message in place via an `m.replace` relation.
 async fn edit_message(room: &Room, id: OwnedEventId, text: &str) {
     let edited = RoomMessageEventContent::text_plain(text)
@@ -98,6 +136,10 @@ pub struct ReloadableState {
     pub comms: CommsConfig,
     /// Per-profile comms mode (sync / async / auto), keyed by profile name.
     pub profile_comms: HashMap<String, CommsMode>,
+    /// Global operating-instructions file, layered into every system prompt.
+    pub operating_file: Option<String>,
+    /// Whether durable-memory injection is enabled.
+    pub memory_enabled: bool,
 }
 
 impl ReloadableState {
@@ -154,6 +196,8 @@ pub struct BotCtx {
     pub workers: Arc<Workers>,
     /// Per-room agentic workdir selections (set via set_workdir), persisted.
     pub room_workdirs: Arc<RoomWorkdirStore>,
+    /// Durable memory files (global + per-room), injected into the system prompt.
+    pub memory: Arc<MemoryStore>,
 }
 
 impl BotCtx {
@@ -258,18 +302,37 @@ pub async fn handle_message(
     if let Err(e) = ctx.history.append(&room_id, ChatMessage::user(&body)) {
         warn!("failed to save user message to history: {}", e);
     }
-    let (llm, system_prompt, profile, model, comms_mode, comms_cfg) = {
+    let (llm, base_prompt, profile, model, comms_mode, comms_cfg, op_global, op_room, mem_enabled) = {
         let st = ctx.state.read().await;
-        let prompt = st
-            .room_configs
-            .get(&room_id)
+        let rc = st.room_configs.get(&room_id);
+        let prompt = rc
             .and_then(|r| r.system_prompt.clone())
             .unwrap_or_else(|| st.system_prompt.clone());
+        let op_room = rc.and_then(|r| r.operating_file.clone());
+        let op_global = st.operating_file.clone();
         let (client, profile) = st.llm_for_room(&room_id);
         let model = client.model().to_string();
         let mode = st.comms_mode_for_profile(&profile);
-        (client, prompt, profile, model, mode, st.comms.clone())
+        (client, prompt, profile, model, mode, st.comms.clone(), op_global, op_room, st.memory_enabled)
     };
+
+    // Assemble the full system prompt: base persona + operating instructions
+    // (global + per-room) + durable memory (global + per-room). All layered files
+    // are read fresh each turn, so edits take effect without a reload.
+    let operating_global = op_global.as_deref().map(read_context_file).unwrap_or_default();
+    let operating_room = op_room.as_deref().map(read_context_file).unwrap_or_default();
+    let (memory_global, memory_room) = if mem_enabled {
+        (ctx.memory.read_global(), ctx.memory.read_room(&room_id))
+    } else {
+        (String::new(), String::new())
+    };
+    let system_prompt = assemble_system_prompt(
+        &base_prompt,
+        &operating_global,
+        &operating_room,
+        &memory_global,
+        &memory_room,
+    );
 
     // Serialize agentic jobs per room — two agents in one working directory clash.
     let agentic = llm.is_subprocess();
@@ -648,6 +711,7 @@ mod tests {
                 require_mention: true,
                 system_prompt: None,
                 profile: Some("reason".into()),
+                operating_file: None,
             },
         );
         let mut profile_comms = HashMap::new();
@@ -660,6 +724,8 @@ mod tests {
             room_profiles: HashMap::new(),
             comms: CommsConfig::default(),
             profile_comms,
+            operating_file: None,
+            memory_enabled: true,
         }
     }
 
@@ -713,6 +779,7 @@ mod tests {
             tool_executor: Arc::new(ToolExecutor::with_projects(None, HashMap::new(), None)),
             workers: Arc::new(Workers::new(4)),
             room_workdirs: Arc::new(RoomWorkdirStore::load(dir.path().join("rw.json"))),
+            memory: Arc::new(MemoryStore::new(dir.path(), None)),
         }
     }
 

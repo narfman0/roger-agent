@@ -32,6 +32,21 @@ the latest turn is always kept. The budget is
 `context_tokens − max_tokens − system_prompt − 256 margin` (floored at 256),
 where `context_tokens` is a per-profile config value (default 8192).
 
+## Context injection
+
+The system message is assembled per turn (`assemble_system_prompt`) by layering,
+in order: the base persona (global or per-room `system_prompt`) → operating
+instructions (global `[context].operating_file` + optional per-room
+`operating_file`) → durable memory (`## Memory (global)` then `## Memory (this
+room)`). Operating files and memory files are read **fresh each turn**, so edits
+take effect without a SIGHUP. Empty/missing files contribute nothing.
+
+Because the history budget is sized off `estimate_tokens(system_prompt)`, anything
+injected here automatically shrinks the history window — injected memory can't
+silently overflow the context. Memory lives under `~/.roger/memory/` (`global.md`
+plus `rooms/<room>.md`) via `MemoryStore`; it is written by compaction (a later
+task) and survives `/clear`. `[memory].enabled = false` disables the memory layer.
+
 ## Response UX
 
 For every response:

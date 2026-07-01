@@ -3,6 +3,7 @@ mod config;
 mod history;
 mod llm;
 mod matrix;
+mod memory;
 mod metrics;
 mod room_profiles;
 mod room_workdirs;
@@ -97,6 +98,8 @@ async fn reload_on_sighup(config_dir: PathBuf, state: Arc<RwLock<ReloadableState
         st.room_configs = cfg.rooms;
         st.comms = cfg.comms;
         st.profile_comms = profile_comms;
+        st.operating_file = cfg.context.operating_file;
+        st.memory_enabled = cfg.memory.enabled;
         // Drop runtime /model overrides that point at a profile that no longer builds.
         let valid: HashSet<String> = st.llms.keys().cloned().collect();
         st.room_profiles.retain(|_, profile| valid.contains(profile));
@@ -145,6 +148,12 @@ async fn main() -> Result<()> {
     // the state dir. Shared between the tool executor (writes) and handler (reads).
     let room_workdirs = Arc::new(room_workdirs::RoomWorkdirStore::load(
         state_dir.join("room_workdirs.json"),
+    ));
+
+    // Durable-memory store (global + per-room files under the state dir).
+    let memory = Arc::new(memory::MemoryStore::new(
+        &state_dir,
+        cfg.memory.global_file.as_deref(),
     ));
 
     // Known projects (name → expanded path) selectable via set_workdir.
@@ -221,6 +230,8 @@ async fn main() -> Result<()> {
         room_profiles: room_profiles_map,
         comms: cfg.comms,
         profile_comms,
+        operating_file: cfg.context.operating_file,
+        memory_enabled: cfg.memory.enabled,
     }));
 
     // Spawn the SIGHUP hot-reload listener
@@ -239,6 +250,7 @@ async fn main() -> Result<()> {
         tool_executor,
         workers,
         room_workdirs,
+        memory,
     };
 
     client.add_event_handler_context(bot_ctx);

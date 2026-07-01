@@ -581,11 +581,14 @@ mod tests {
         let defs = tool_definitions();
         assert!(defs.is_array());
         let arr = defs.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.len(), 6);
         let names: Vec<&str> = arr
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, &["web_search", "web_fetch", "set_workdir"]);
+        assert_eq!(
+            names,
+            &["web_search", "web_fetch", "read_file", "write_file", "list_dir", "set_workdir"]
+        );
     }
 }
