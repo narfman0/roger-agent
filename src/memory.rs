@@ -4,6 +4,8 @@
 //! (a later task) writes them; this module provides the reads used by injection.
 
 use crate::config::expand_tilde;
+use crate::history::estimate_tokens;
+use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 pub struct MemoryStore {
@@ -41,12 +43,47 @@ impl MemoryStore {
     pub fn read_room(&self, room_id: &str) -> String {
         read_trimmed(&self.room_path(room_id))
     }
+
+    /// Estimated token size of the global memory (0 when empty).
+    pub fn global_tokens(&self) -> usize {
+        tokens_of(&self.read_global())
+    }
+
+    /// Estimated token size of a room's memory (0 when empty).
+    pub fn room_tokens(&self, room_id: &str) -> usize {
+        tokens_of(&self.read_room(room_id))
+    }
+
+    /// Delete the global memory file (for `/forget global`).
+    pub fn clear_global(&self) -> Result<()> {
+        remove_if_exists(&self.global_path)
+    }
+
+    /// Delete a room's memory file (for `/forget`).
+    pub fn clear_room(&self, room_id: &str) -> Result<()> {
+        remove_if_exists(&self.room_path(room_id))
+    }
 }
 
 fn read_trimmed(path: &Path) -> String {
     std::fs::read_to_string(path)
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
+}
+
+fn tokens_of(s: &str) -> usize {
+    if s.is_empty() {
+        0
+    } else {
+        estimate_tokens(s)
+    }
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

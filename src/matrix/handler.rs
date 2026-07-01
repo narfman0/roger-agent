@@ -540,6 +540,7 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
             "**Roger commands**\n\
              `/help` — show this list\n\
              `/clear` — wipe conversation history for this room\n\
+             `/forget` — wipe this room's durable memory (`/forget global` for shared)\n\
              `/status` — show uptime, model, and history stats\n\
              `/model [name]` — show/switch this room's LLM profile (`/model reset` to revert)\n\
              `/jobs` — list active background jobs\n\
@@ -566,8 +567,9 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
                 client.model().to_string()
             };
             Some(format!(
-                "**Roger status**\nUptime: {}h {}m {}s\nProfile: {} ({})\nHistory: {} messages (this room)\nRequests: {} ({} errors), avg {}ms\nActive jobs: {}",
+                "**Roger status**\nUptime: {}h {}m {}s\nProfile: {} ({})\nHistory: {} messages (this room)\nMemory: {}t global, {}t this room\nRequests: {} ({} errors), avg {}ms\nActive jobs: {}",
                 h, m, s, profile, model_desc, history_len,
+                ctx.memory.global_tokens(), ctx.memory.room_tokens(room_id),
                 m_snap.requests, m_snap.errors, m_snap.avg_latency_ms,
                 ctx.workers.count()
             ))
@@ -594,6 +596,18 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
                 Ok(id) if ctx.workers.cancel(id) => Some(format!("Cancelled job `{}`.", id)),
                 Ok(id) => Some(format!("No active job `{}`. Try `/jobs`.", id)),
                 Err(_) => Some("Usage: `/cancel <id>` (see `/jobs`).".to_string()),
+            }
+        }
+        "/forget" => {
+            let scope = parts.get(1).map(|s| s.trim()).unwrap_or("");
+            let (res, what) = if scope == "global" {
+                (ctx.memory.clear_global(), "Global memory")
+            } else {
+                (ctx.memory.clear_room(room_id), "This room's memory")
+            };
+            match res {
+                Ok(_) => Some(format!("{} cleared.", what)),
+                Err(e) => Some(format!("Failed to clear memory: {}", e)),
             }
         }
         "/model" => Some(handle_model_command(parts.get(1).copied(), room_id, ctx).await),
