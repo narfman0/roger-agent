@@ -1,6 +1,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// Rough token estimate for a message body. Real tokenization is model-specific;
 /// ~4 characters per token is a decent cross-model heuristic, plus a small
@@ -31,17 +33,35 @@ impl ChatMessage {
 
 pub struct HistoryStore {
     data_dir: PathBuf,
+    /// Per-room mutation lock so a compaction rewrite and a concurrent append (or
+    /// two appends) don't clobber each other's read-modify-write.
+    locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl HistoryStore {
     pub fn new(data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
-        Ok(HistoryStore { data_dir })
+        Ok(HistoryStore { data_dir, locks: Mutex::new(HashMap::new()) })
     }
 
     fn path(&self, room_id: &str) -> PathBuf {
         let safe = room_id.replace(['!', ':', '/'], "_");
         self.data_dir.join(format!("{}.json", safe))
+    }
+
+    fn lock_for(&self, room_id: &str) -> Arc<Mutex<()>> {
+        self.locks.lock().unwrap().entry(room_id.to_string()).or_default().clone()
+    }
+
+    /// Write the whole history file atomically (temp + rename) so a concurrent
+    /// reader never observes a partial file.
+    fn write_atomic(&self, room_id: &str, msgs: &[ChatMessage]) -> Result<()> {
+        let path = self.path(room_id);
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(msgs)?)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
     }
 
     pub fn load(&self, room_id: &str) -> Vec<ChatMessage> {
@@ -53,10 +73,26 @@ impl HistoryStore {
     }
 
     pub fn append(&self, room_id: &str, msg: ChatMessage) -> Result<()> {
+        let lock = self.lock_for(room_id);
+        let _g = lock.lock().unwrap();
         let mut msgs = self.load(room_id);
         msgs.push(msg);
-        std::fs::write(self.path(room_id), serde_json::to_string_pretty(&msgs)?)?;
-        Ok(())
+        self.write_atomic(room_id, &msgs)
+    }
+
+    /// Replace a room's entire history (used by compaction). Serialized against
+    /// appends via the per-room lock; written atomically.
+    #[allow(dead_code)] // wired up by compaction (next commit)
+    pub fn rewrite(&self, room_id: &str, msgs: Vec<ChatMessage>) -> Result<()> {
+        let lock = self.lock_for(room_id);
+        let _g = lock.lock().unwrap();
+        self.write_atomic(room_id, &msgs)
+    }
+
+    /// Estimated total token count of a room's full history.
+    #[allow(dead_code)] // wired up by compaction (next commit)
+    pub fn token_count(&self, room_id: &str) -> usize {
+        self.load(room_id).iter().map(|m| estimate_tokens(&m.content)).sum()
     }
 
     /// Returns up to `max` most recent messages.
@@ -90,6 +126,8 @@ impl HistoryStore {
     }
 
     pub fn clear(&self, room_id: &str) -> Result<()> {
+        let lock = self.lock_for(room_id);
+        let _g = lock.lock().unwrap();
         let path = self.path(room_id);
         if path.exists() {
             std::fs::remove_file(path)?;
@@ -201,5 +239,34 @@ mod tests {
     fn test_windowed_by_tokens_empty_room() {
         let (_dir, store) = temp_store();
         assert!(store.windowed_by_tokens("!room:server", 1000).is_empty());
+    }
+
+    #[test]
+    fn test_rewrite_replaces_history() {
+        let (_dir, store) = temp_store();
+        for i in 0..5u32 {
+            store.append("!room:server", ChatMessage::user(i.to_string())).unwrap();
+        }
+        store
+            .rewrite(
+                "!room:server",
+                vec![ChatMessage::system("summary"), ChatMessage::user("4")],
+            )
+            .unwrap();
+        let msgs = store.load("!room:server");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[0].content, "summary");
+        assert_eq!(msgs[1].content, "4");
+    }
+
+    #[test]
+    fn test_token_count_sums_estimates() {
+        let (_dir, store) = temp_store();
+        assert_eq!(store.token_count("!room:server"), 0);
+        // Each "hi" body → 2/4 + 4 = 4 tokens.
+        store.append("!room:server", ChatMessage::user("hi")).unwrap();
+        store.append("!room:server", ChatMessage::assistant("hi")).unwrap();
+        assert_eq!(store.token_count("!room:server"), 8);
     }
 }
