@@ -1,5 +1,9 @@
 # Design: context injection + autocompaction
 
+> **Status: implemented** (commits 4.6.1–4.6.4). See `docs/architecture.md` →
+> Context injection / Compaction for the shipped behaviour. This document is the
+> original design record.
+
 For roger as a long-running service. Two features, one shared concern (the system
 prompt's size vs. the history budget):
 
@@ -100,18 +104,20 @@ profile = "fast"          # LLM used to summarize + distill
 - **Not nightly.** Compaction is purely reactive to size. (A nightly sweep can be
   added later as a background task like `reload_on_sighup` if desired.)
 
-## Build plan (commits on master)
+## Build plan (all shipped)
 
-1. **Injection** — `[context]` + `[memory]` config; `assemble_system_prompt`;
-   operating-file caching in `ReloadableState` + SIGHUP; on-demand memory reads;
-   wire into `handle_message` prompt assembly. (Memory files may not exist yet →
-   empty sections.)
-2. **History rewrite + lock** — `HistoryStore::rewrite`, per-room mutation lock,
-   `token_count(room)` helper.
-3. **Compaction** — `src/compaction.rs` (summarize + distill), the size trigger in
-   `run_response_job`, `[compaction]` config, memory self-compaction on cap.
-4. **Memory store + commands** — `src/memory.rs` (global + per-room read/append/
-   rewrite with caps); `/forget`; `/status` shows memory sizes.
+1. ✅ **4.6.1 Injection** — `[context]` + `[memory]` config; `assemble_system_prompt`;
+   config carried in `ReloadableState` (SIGHUP); on-demand reads of operating +
+   memory files; wired into `handle_message`. (Files may be absent → empty sections.)
+   *Deviation:* operating/memory files are read on demand (fresh each turn), not
+   cached — simpler and edits apply without a reload.
+2. ✅ **4.6.2 History rewrite + lock** — atomic writes, per-room mutation `Mutex`,
+   `HistoryStore::rewrite`, `token_count`.
+3. ✅ **4.6.3 Memory commands** — `MemoryStore` clear/size; `/forget`; memory sizes
+   in `/status`. *(Reordered before compaction; memory writes moved into step 4.)*
+4. ✅ **4.6.4 Compaction** — `src/compaction.rs` (summarize + distill, per-room
+   guard), the size trigger in `run_response_job`, `[compaction]` config,
+   `MemoryStore` atomic append/rewrite, memory self-compaction at the caps.
 
 ## Key files
 `src/config.rs` ([context]/[memory]/[compaction]); `src/matrix/handler.rs` (assembly,

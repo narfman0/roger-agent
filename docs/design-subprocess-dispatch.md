@@ -1,5 +1,8 @@
 # Design: Subprocess dispatch (task 4.5 / Phase 3 #7)
 
+> **Status: implemented** (4.5.0–4.5.5, claude-code + opencode). See
+> `docs/architecture.md` → Backend kinds / Orchestrator. Original design record.
+
 Make `kind = "claude-code"` and `kind = "opencode"` backends actually spawn the
 respective CLI as a subprocess and stream its output, instead of being silently
 treated as OpenAI HTTP (which is what `Config::build_client` does today — it
