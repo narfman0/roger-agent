@@ -82,7 +82,6 @@ impl HistoryStore {
 
     /// Replace a room's entire history (used by compaction). Serialized against
     /// appends via the per-room lock; written atomically.
-    #[allow(dead_code)] // wired up by compaction (next commit)
     pub fn rewrite(&self, room_id: &str, msgs: Vec<ChatMessage>) -> Result<()> {
         let lock = self.lock_for(room_id);
         let _g = lock.lock().unwrap();
@@ -90,7 +89,6 @@ impl HistoryStore {
     }
 
     /// Estimated total token count of a room's full history.
-    #[allow(dead_code)] // wired up by compaction (next commit)
     pub fn token_count(&self, room_id: &str) -> usize {
         self.load(room_id).iter().map(|m| estimate_tokens(&m.content)).sum()
     }

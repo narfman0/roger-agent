@@ -7,10 +7,14 @@ use crate::config::expand_tilde;
 use crate::history::estimate_tokens;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 pub struct MemoryStore {
     global_path: PathBuf,
     rooms_dir: PathBuf,
+    /// Serializes writes so concurrent compactions (e.g. two rooms appending to the
+    /// shared global file) don't clobber each other's read-modify-write.
+    write_lock: Mutex<()>,
 }
 
 impl MemoryStore {
@@ -25,6 +29,7 @@ impl MemoryStore {
         MemoryStore {
             global_path,
             rooms_dir: base.join("rooms"),
+            write_lock: Mutex::new(()),
         }
     }
 
@@ -63,6 +68,58 @@ impl MemoryStore {
     pub fn clear_room(&self, room_id: &str) -> Result<()> {
         remove_if_exists(&self.room_path(room_id))
     }
+
+    /// Append a block to a room's memory (blank-line separated), creating the file.
+    pub fn append_room(&self, room_id: &str, block: &str) -> Result<()> {
+        let path = self.room_path(room_id);
+        self.append(&path, block)
+    }
+
+    /// Append a block to the global memory.
+    pub fn append_global(&self, block: &str) -> Result<()> {
+        let path = self.global_path.clone();
+        self.append(&path, block)
+    }
+
+    /// Replace a room's memory with `content` (used by memory self-compaction).
+    pub fn rewrite_room(&self, room_id: &str, content: &str) -> Result<()> {
+        let path = self.room_path(room_id);
+        let _g = self.write_lock.lock().unwrap();
+        write_atomic(&path, content)
+    }
+
+    /// Replace the global memory with `content`.
+    pub fn rewrite_global(&self, content: &str) -> Result<()> {
+        let path = self.global_path.clone();
+        let _g = self.write_lock.lock().unwrap();
+        write_atomic(&path, content)
+    }
+
+    fn append(&self, path: &Path, block: &str) -> Result<()> {
+        let block = block.trim();
+        if block.is_empty() {
+            return Ok(());
+        }
+        let _g = self.write_lock.lock().unwrap();
+        let current = read_trimmed(path);
+        let next = if current.is_empty() {
+            block.to_string()
+        } else {
+            format!("{}\n{}", current, block)
+        };
+        write_atomic(path, &next)
+    }
+}
+
+fn write_atomic(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut tmp = path.to_path_buf().into_os_string();
+    tmp.push(".tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn read_trimmed(path: &Path) -> String {

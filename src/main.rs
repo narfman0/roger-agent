@@ -1,4 +1,5 @@
 mod audio;
+mod compaction;
 mod config;
 mod history;
 mod llm;
@@ -100,6 +101,9 @@ async fn reload_on_sighup(config_dir: PathBuf, state: Arc<RwLock<ReloadableState
         st.profile_comms = profile_comms;
         st.operating_file = cfg.context.operating_file;
         st.memory_enabled = cfg.memory.enabled;
+        st.memory_max_global_tokens = cfg.memory.max_global_tokens;
+        st.memory_max_room_tokens = cfg.memory.max_room_tokens;
+        st.compaction = cfg.compaction;
         // Drop runtime /model overrides that point at a profile that no longer builds.
         let valid: HashSet<String> = st.llms.keys().cloned().collect();
         st.room_profiles.retain(|_, profile| valid.contains(profile));
@@ -232,6 +236,9 @@ async fn main() -> Result<()> {
         profile_comms,
         operating_file: cfg.context.operating_file,
         memory_enabled: cfg.memory.enabled,
+        memory_max_global_tokens: cfg.memory.max_global_tokens,
+        memory_max_room_tokens: cfg.memory.max_room_tokens,
+        compaction: cfg.compaction,
     }));
 
     // Spawn the SIGHUP hot-reload listener

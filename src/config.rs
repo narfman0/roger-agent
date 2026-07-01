@@ -201,11 +201,55 @@ pub struct MemoryConfig {
     /// (resolved by `MemoryStore`) when unset.
     #[serde(default)]
     pub global_file: Option<String>,
+    /// Compaction re-summarizes a memory file when it exceeds these token caps.
+    #[serde(default = "default_max_global_tokens")]
+    pub max_global_tokens: usize,
+    #[serde(default = "default_max_room_tokens")]
+    pub max_room_tokens: usize,
 }
+
+fn default_max_global_tokens() -> usize { 1500 }
+fn default_max_room_tokens() -> usize { 3000 }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
-        MemoryConfig { enabled: true, global_file: None }
+        MemoryConfig {
+            enabled: true,
+            global_file: None,
+            max_global_tokens: default_max_global_tokens(),
+            max_room_tokens: default_max_room_tokens(),
+        }
+    }
+}
+
+/// Size-triggered conversation compaction: when a room's history exceeds
+/// `trigger_tokens`, summarize the older turns and distill durable facts into
+/// memory, keeping the most recent turns verbatim.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompactionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_trigger_tokens")]
+    pub trigger_tokens: usize,
+    #[serde(default = "default_keep_recent")]
+    pub keep_recent_turns: usize,
+    /// LLM profile used to summarize + distill (a cheap/fast one).
+    #[serde(default = "default_compaction_profile")]
+    pub profile: String,
+}
+
+fn default_trigger_tokens() -> usize { 6000 }
+fn default_keep_recent() -> usize { 8 }
+fn default_compaction_profile() -> String { "fast".to_string() }
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        CompactionConfig {
+            enabled: true,
+            trigger_tokens: default_trigger_tokens(),
+            keep_recent_turns: default_keep_recent(),
+            profile: default_compaction_profile(),
+        }
     }
 }
 
@@ -218,6 +262,8 @@ struct ProfilesFile {
     context: Option<ContextConfig>,
     #[serde(default)]
     memory: Option<MemoryConfig>,
+    #[serde(default)]
+    compaction: Option<CompactionConfig>,
     #[serde(default)]
     rooms: HashMap<String, RoomConfig>,
     /// Known projects (name → path) the LLM can select via the `set_workdir` tool.
@@ -237,6 +283,7 @@ pub struct Config {
     pub comms: CommsConfig,
     pub context: ContextConfig,
     pub memory: MemoryConfig,
+    pub compaction: CompactionConfig,
     pub rooms: HashMap<String, RoomConfig>,
     /// Known projects (name → path) selectable via the `set_workdir` tool.
     pub projects: HashMap<String, String>,
@@ -305,6 +352,7 @@ impl Config {
             comms: profiles_file.comms.unwrap_or_default(),
             context: profiles_file.context.unwrap_or_default(),
             memory: profiles_file.memory.unwrap_or_default(),
+            compaction: profiles_file.compaction.unwrap_or_default(),
             rooms,
             projects: profiles_file.projects,
             matrix_homeserver,

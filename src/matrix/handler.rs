@@ -1,6 +1,6 @@
 use crate::{
     audio::SpeachesClient,
-    config::{CommsConfig, CommsMode, RoomConfig},
+    config::{CommsConfig, CommsMode, CompactionConfig, RoomConfig},
     history::{ChatMessage, HistoryStore},
     llm::ProfileLlm,
     memory::MemoryStore,
@@ -140,6 +140,11 @@ pub struct ReloadableState {
     pub operating_file: Option<String>,
     /// Whether durable-memory injection is enabled.
     pub memory_enabled: bool,
+    /// Memory self-compaction caps (tokens).
+    pub memory_max_global_tokens: usize,
+    pub memory_max_room_tokens: usize,
+    /// Size-triggered history compaction settings.
+    pub compaction: CompactionConfig,
 }
 
 impl ReloadableState {
@@ -524,6 +529,39 @@ async fn run_response_job(
             }
         }
     }
+
+    // The reply is persisted; compact the room if its history has grown too large.
+    maybe_compact(&bot, &room_id).await;
+}
+
+/// If the room's history exceeds the compaction threshold, spawn a detached
+/// compaction task (summarize old turns + distill memory). Fast to call: it only
+/// reads config + the history size, then spawns.
+async fn maybe_compact(bot: &BotCtx, room_id: &str) {
+    let (cfg, llm, max_global, max_room) = {
+        let st = bot.state.read().await;
+        let cfg = st.compaction.clone();
+        let llm = st.llms.get(&cfg.profile).cloned();
+        (cfg, llm, st.memory_max_global_tokens, st.memory_max_room_tokens)
+    };
+    if !cfg.enabled || bot.history.token_count(room_id) <= cfg.trigger_tokens {
+        return;
+    }
+    let Some(llm) = llm else {
+        warn!("compaction profile '{}' not built; skipping", cfg.profile);
+        return;
+    };
+    tokio::spawn(crate::compaction::compact_room(
+        bot.history.clone(),
+        bot.memory.clone(),
+        llm,
+        room_id.to_string(),
+        crate::compaction::CompactionParams {
+            keep_recent_turns: cfg.keep_recent_turns,
+            max_global_tokens: max_global,
+            max_room_tokens: max_room,
+        },
+    ));
 }
 
 /// Returns Some(reply) if the message is a slash command, None otherwise.
@@ -740,6 +778,9 @@ mod tests {
             profile_comms,
             operating_file: None,
             memory_enabled: true,
+            memory_max_global_tokens: 1500,
+            memory_max_room_tokens: 3000,
+            compaction: CompactionConfig::default(),
         }
     }
 

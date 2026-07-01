@@ -44,8 +44,21 @@ take effect without a SIGHUP. Empty/missing files contribute nothing.
 Because the history budget is sized off `estimate_tokens(system_prompt)`, anything
 injected here automatically shrinks the history window — injected memory can't
 silently overflow the context. Memory lives under `~/.roger/memory/` (`global.md`
-plus `rooms/<room>.md`) via `MemoryStore`; it is written by compaction (a later
-task) and survives `/clear`. `[memory].enabled = false` disables the memory layer.
+plus `rooms/<room>.md`) via `MemoryStore`; it is written by compaction and survives
+`/clear` (drop it with `/forget`). `[memory].enabled = false` disables the layer.
+
+## Compaction
+
+When a room's history exceeds `[compaction].trigger_tokens`, the response handler
+spawns a **detached** compaction task (`src/compaction.rs`, guarded so a room is
+never compacted twice at once). It keeps the last `keep_recent_turns` verbatim,
+sends the older turns to the `[compaction].profile` LLM, and parses a three-section
+reply: a **summary**, **room-specific** durable facts, and **broadly-useful** facts.
+`HistoryStore::rewrite` replaces the room's history with `[summary] + recent`; the
+two fact sets are appended to the per-room and global memory files. When a memory
+file exceeds its `[memory].max_*_tokens` cap it is re-summarized in place, so memory
+can't grow without bound. If the model returns no usable summary, history is left
+intact. There is no nightly job — compaction is purely reactive to size.
 
 ## Response UX
 
