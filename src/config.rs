@@ -277,6 +277,30 @@ pub struct McpConfig {
     pub servers: HashMap<String, McpServerConfig>,
 }
 
+/// Git-worktree isolation for agentic subprocess jobs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorktreeConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Where worktrees are created (`~` expanded). Default `~/.roger/worktrees`.
+    #[serde(default)]
+    pub base_dir: Option<String>,
+    #[serde(default = "default_branch_prefix")]
+    pub branch_prefix: String,
+}
+
+fn default_branch_prefix() -> String { "roger".to_string() }
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        WorktreeConfig {
+            enabled: true,
+            base_dir: None,
+            branch_prefix: default_branch_prefix(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ProfilesFile {
     profiles: HashMap<String, ProfileConfig>,
@@ -284,6 +308,8 @@ struct ProfilesFile {
     comms: Option<CommsConfig>,
     #[serde(default)]
     mcp: Option<McpConfig>,
+    #[serde(default)]
+    worktrees: Option<WorktreeConfig>,
     #[serde(default)]
     context: Option<ContextConfig>,
     #[serde(default)]
@@ -311,6 +337,7 @@ pub struct Config {
     pub memory: MemoryConfig,
     pub compaction: CompactionConfig,
     pub mcp: McpConfig,
+    pub worktrees: WorktreeConfig,
     pub rooms: HashMap<String, RoomConfig>,
     /// Known projects (name → path) selectable via the `set_workdir` tool.
     pub projects: HashMap<String, String>,
@@ -381,6 +408,7 @@ impl Config {
             memory: profiles_file.memory.unwrap_or_default(),
             compaction: profiles_file.compaction.unwrap_or_default(),
             mcp: profiles_file.mcp.unwrap_or_default(),
+            worktrees: profiles_file.worktrees.unwrap_or_default(),
             rooms,
             projects: profiles_file.projects,
             matrix_homeserver,
@@ -420,7 +448,7 @@ impl Config {
                 )))
             }
             BackendKind::ClaudeCode | BackendKind::OpenCode => {
-                use crate::subprocess::{ProcLimits, SubprocessBackend, SubprocessKind};
+                use crate::subprocess::{ProcLimits, SubprocessBackend, SubprocessKind, WorktreePolicy};
                 let flavor = if backend.kind == BackendKind::ClaudeCode {
                     SubprocessKind::ClaudeCode
                 } else {
@@ -437,6 +465,16 @@ impl Config {
                     max_budget_usd: profile.max_budget_usd,
                     max_turns: profile.max_turns,
                 };
+                let worktree = WorktreePolicy {
+                    enabled: self.worktrees.enabled,
+                    base_dir: self
+                        .worktrees
+                        .base_dir
+                        .as_deref()
+                        .map(expand_tilde)
+                        .unwrap_or_else(|| expand_tilde("~/.roger/worktrees")),
+                    branch_prefix: self.worktrees.branch_prefix.clone(),
+                };
                 Ok(crate::llm::Backend::Subprocess(SubprocessBackend::new(
                     flavor,
                     backend.model.clone(),
@@ -449,6 +487,7 @@ impl Config {
                         .clone()
                         .unwrap_or_else(|| "acceptEdits".to_string()),
                     limits,
+                    worktree,
                 )))
             }
         }

@@ -221,6 +221,22 @@ leaves no artifacts — the workdir is an external, real project (which may be r
 own repo). Because roger's own state lives in `~/.roger`, pointing an agent at the
 repo doesn't expose its Matrix token/crypto store.
 
+## Worktree isolation
+
+Agentic subprocess jobs (claude-code/opencode) can rewrite files in the room's
+workdir — a real repo. When `[worktrees].enabled` (default) and the workdir is a
+git repo, `subprocess.rs` runs the job in a throwaway worktree on a fresh branch
+(`<prefix>/<room>/<n>` under `[worktrees].base_dir`, default `~/.roger/worktrees`)
+instead of the live checkout. `WorktreeGuard::create` records the base revision;
+`execute_in` runs the CLI with that worktree as cwd; on completion `finalize`
+commits anything the agent left uncommitted, and — comparing HEAD against the base
+rev, so the agent's own commits count — either keeps the branch and appends a
+`🌿 branch + diffstat` note to the reply, or (no change) removes the worktree and
+deletes the empty branch. A `Drop` guard force-removes the worktree if the job is
+cancelled before finalize. Non-git workdirs fall back to running directly in the
+workdir. Net effect: agent edits land on a branch for review/merge; the running
+deployment is never modified out from under itself.
+
 ## Orchestrator: comms modes
 
 The whole response pipeline for a turn (produce → stream → fallback → metrics →

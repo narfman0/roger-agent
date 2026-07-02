@@ -10,8 +10,9 @@
 use crate::history::ChatMessage;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -49,6 +50,16 @@ pub enum SubprocessKind {
     OpenCode,
 }
 
+/// Git-worktree isolation policy for agentic jobs. When enabled and the workdir is
+/// a git repo, each job runs in a throwaway worktree on a fresh branch; changes are
+/// committed to that branch for review and the worktree is removed.
+#[derive(Debug, Clone)]
+pub struct WorktreePolicy {
+    pub enabled: bool,
+    pub base_dir: PathBuf,
+    pub branch_prefix: String,
+}
+
 /// Lifecycle limits for one subprocess run.
 #[derive(Debug, Clone)]
 pub struct ProcLimits {
@@ -77,6 +88,7 @@ pub struct SubprocessBackend {
     /// `--permission-mode` (e.g. acceptEdits, bypassPermissions).
     permission_mode: String,
     limits: ProcLimits,
+    worktree: WorktreePolicy,
 }
 
 impl SubprocessBackend {
@@ -90,6 +102,7 @@ impl SubprocessBackend {
         extra_dirs: Vec<PathBuf>,
         permission_mode: String,
         limits: ProcLimits,
+        worktree: WorktreePolicy,
     ) -> Self {
         SubprocessBackend {
             flavor,
@@ -100,6 +113,7 @@ impl SubprocessBackend {
             extra_dirs,
             permission_mode,
             limits,
+            worktree,
         }
     }
 
@@ -140,6 +154,46 @@ impl SubprocessBackend {
             .await
             .map_err(|_| anyhow!("child semaphore closed"))?;
 
+        // Worktree isolation: for an agentic job in a git repo, run in a throwaway
+        // worktree on a fresh branch so the live checkout is never touched. Changes
+        // are committed to that branch and surfaced; the worktree is then removed.
+        let room = crate::tools::ROOM_ID
+            .try_with(|r| r.clone())
+            .unwrap_or_else(|_| "job".to_string());
+        let (cwd, guard) = if self.worktree.enabled && is_git_repo(&workdir).await {
+            match WorktreeGuard::create(&workdir, &self.worktree, &room) {
+                Ok(g) => (g.path().to_path_buf(), Some(g)),
+                Err(e) => {
+                    warn!("worktree setup failed ({}); running in the live workdir", e);
+                    (workdir.clone(), None)
+                }
+            }
+        } else {
+            (workdir.clone(), None)
+        };
+
+        let result = self.execute_in(&cwd, messages, tx).await;
+
+        match guard {
+            Some(mut g) => {
+                let note = g.finalize().await.unwrap_or(None);
+                match (result, note) {
+                    (Ok(text), Some(n)) => Ok(format!("{}\n\n🌿 {}", text, n)),
+                    (Ok(text), None) => Ok(text),
+                    (Err(e), _) => Err(e),
+                }
+            }
+            None => result,
+        }
+    }
+
+    /// Spawn the CLI in `cwd`, stream output to `tx`, and return the final text.
+    async fn execute_in(
+        &self,
+        cwd: &Path,
+        messages: &[ChatMessage],
+        tx: Option<mpsc::Sender<String>>,
+    ) -> Result<String> {
         let (system, prompt) = render_prompt(messages);
         let program = match self.flavor {
             SubprocessKind::ClaudeCode => "claude",
@@ -214,14 +268,14 @@ impl SubprocessBackend {
             }
         }
 
-        cmd.current_dir(&workdir)
+        cmd.current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .process_group(0); // own group so we can kill the whole tree
 
-        info!(program, model = %self.model, workdir = %workdir.display(), "spawning subprocess");
+        info!(program, model = %self.model, workdir = %cwd.display(), "spawning subprocess");
         let mut child = cmd.spawn().map_err(|e| anyhow!("failed to spawn {}: {}", program, e))?;
         let pid = child.id().map(|p| p as i32);
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
@@ -450,6 +504,165 @@ async fn read_stderr(child: &mut tokio::process::Child) -> String {
     }
 }
 
+// ── Worktree isolation ───────────────────────────────────────────────────────
+
+static WORKTREE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Is `dir` inside a git work tree?
+async fn is_git_repo(dir: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// A per-job git worktree. `finalize` commits any changes to the branch and removes
+/// the worktree; `Drop` force-removes it as a safety net on cancel/panic.
+struct WorktreeGuard {
+    repo: PathBuf,
+    path: PathBuf,
+    branch: String,
+    base_rev: String,
+    armed: bool,
+}
+
+impl WorktreeGuard {
+    fn create(repo: &Path, policy: &WorktreePolicy, room: &str) -> Result<Self> {
+        let id = WORKTREE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let safe = room.replace(['!', ':', '/', ' '], "_");
+        let branch = format!("{}/{}/{}", policy.branch_prefix, safe, id);
+        let path = policy.base_dir.join(format!("{}-{}", safe, id));
+        std::fs::create_dir_all(&policy.base_dir).ok();
+        // Base revision the worktree branches from, so finalize can tell whether
+        // anything changed even if the agent made its own commits.
+        let base = std::process::Command::new("git")
+            .arg("-C").arg(repo).args(["rev-parse", "HEAD"]).output()
+            .map_err(|e| anyhow!("git rev-parse: {}", e))?;
+        let base_rev = String::from_utf8_lossy(&base.stdout).trim().to_string();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "add", "-b", &branch])
+            .arg(&path)
+            .arg("HEAD")
+            .output()
+            .map_err(|e| anyhow!("git worktree add: {}", e))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        info!(branch = %branch, path = %path.display(), "created worktree");
+        Ok(WorktreeGuard { repo: repo.to_path_buf(), path, branch, base_rev, armed: true })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Commit anything the agent left uncommitted, then decide (vs the base rev)
+    /// whether the branch has real changes: if so keep it and return a note; if not
+    /// remove the worktree and delete the empty branch.
+    async fn finalize(&mut self) -> Result<Option<String>> {
+        run_git(&self.path, &["add", "-A"]).await;
+        if !git_ok(&self.path, &["diff", "--cached", "--quiet"]).await {
+            run_git(
+                &self.path,
+                &[
+                    "-c", "user.name=roger",
+                    "-c", "user.email=roger@localhost",
+                    "commit", "-m", &format!("roger: {}", self.branch),
+                ],
+            )
+            .await;
+        }
+        let head = git_output(&self.path, &["rev-parse", "HEAD"]).await;
+        let changed = !head.is_empty() && head != self.base_rev;
+        let note = if changed {
+            let range = format!("{}..HEAD", self.base_rev);
+            let log = git_output(&self.path, &["log", "--oneline", &range]).await;
+            let stat = git_output(&self.path, &["diff", "--stat", &range]).await;
+            let body = log
+                .lines()
+                .chain(stat.lines())
+                .take(10)
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(format!("branch `{}`\n{}", self.branch, body))
+        } else {
+            None
+        };
+        let path = self.path.to_string_lossy();
+        run_git(&self.repo, &["worktree", "remove", "--force", path.as_ref()]).await;
+        if !changed {
+            run_git(&self.repo, &["branch", "-D", &self.branch]).await;
+        }
+        self.armed = false;
+        Ok(note)
+    }
+}
+
+impl Drop for WorktreeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort synchronous cleanup if we were cancelled before finalize.
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.repo)
+                .args(["worktree", "remove", "--force"])
+                .arg(&self.path)
+                .output();
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.repo)
+                .args(["worktree", "prune"])
+                .output();
+        }
+    }
+}
+
+async fn run_git(dir: &Path, args: &[&str]) {
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
+async fn git_ok(dir: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+async fn git_output(dir: &Path, args: &[&str]) -> String {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .await
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +771,7 @@ mod tests {
                 max_budget_usd: None,
                 max_turns: Some(1),
             },
+            WorktreePolicy { enabled: false, base_dir: PathBuf::from("/tmp"), branch_prefix: "roger".into() },
         );
         let msgs = vec![
             ChatMessage::system("Be terse."),
@@ -587,6 +801,7 @@ mod tests {
                 max_budget_usd: None,
                 max_turns: None,
             },
+            WorktreePolicy { enabled: false, base_dir: PathBuf::from("/tmp"), branch_prefix: "roger".into() },
         );
         let msgs = vec![ChatMessage::user("Reply with exactly the single word: ok")];
         let out = b.chat(&msgs).await.expect("opencode run should succeed");
@@ -605,5 +820,97 @@ mod tests {
         assert!(prompt.contains("User: first"));
         assert!(prompt.contains("Assistant: reply"));
         assert!(prompt.contains("User: second"));
+    }
+
+    fn git_init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(p).args(args).output().unwrap();
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(p.join("README.md"), "hi").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "init"]);
+        dir
+    }
+
+    fn branch_list(repo: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C").arg(repo).args(["branch", "--list"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[tokio::test]
+    async fn is_git_repo_detects_repos() {
+        let repo = git_init_repo();
+        assert!(is_git_repo(repo.path()).await);
+        let plain = tempfile::tempdir().unwrap();
+        assert!(!is_git_repo(plain.path()).await);
+    }
+
+    #[tokio::test]
+    async fn worktree_commits_changes_and_keeps_branch() {
+        let repo = git_init_repo();
+        let base = tempfile::tempdir().unwrap();
+        let policy = WorktreePolicy {
+            enabled: true,
+            base_dir: base.path().to_path_buf(),
+            branch_prefix: "roger".into(),
+        };
+        let mut g = WorktreeGuard::create(repo.path(), &policy, "!room:s").unwrap();
+        let wt = g.path().to_path_buf();
+        assert!(wt.is_dir());
+        std::fs::write(wt.join("new.txt"), "content").unwrap();
+
+        let note = g.finalize().await.unwrap();
+        assert!(note.unwrap().contains("roger/_room_s/"));
+        assert!(!wt.exists(), "worktree dir should be removed");
+        assert!(branch_list(repo.path()).contains("roger/_room_s/"), "branch should remain");
+    }
+
+    #[tokio::test]
+    async fn worktree_keeps_agents_own_commits() {
+        // The agent may commit inside the worktree itself; finalize must detect that
+        // (vs the base rev) and keep the branch, not delete it as "unchanged".
+        let repo = git_init_repo();
+        let base = tempfile::tempdir().unwrap();
+        let policy = WorktreePolicy {
+            enabled: true,
+            base_dir: base.path().to_path_buf(),
+            branch_prefix: "roger".into(),
+        };
+        let mut g = WorktreeGuard::create(repo.path(), &policy, "!c:s").unwrap();
+        let wt = g.path().to_path_buf();
+        std::fs::write(wt.join("a.txt"), "x").unwrap();
+        for args in [
+            ["add", "-A"].as_slice(),
+            ["-c", "user.name=a", "-c", "user.email=a@a", "commit", "-qm", "agent"].as_slice(),
+        ] {
+            std::process::Command::new("git").arg("-C").arg(&wt).args(args).output().unwrap();
+        }
+        let note = g.finalize().await.unwrap();
+        assert!(note.is_some(), "agent's own commit must be kept");
+        assert!(branch_list(repo.path()).contains("roger/_c_s/"));
+    }
+
+    #[tokio::test]
+    async fn worktree_no_changes_removes_branch() {
+        let repo = git_init_repo();
+        let base = tempfile::tempdir().unwrap();
+        let policy = WorktreePolicy {
+            enabled: true,
+            base_dir: base.path().to_path_buf(),
+            branch_prefix: "roger".into(),
+        };
+        let mut g = WorktreeGuard::create(repo.path(), &policy, "!empty:s").unwrap();
+        let wt = g.path().to_path_buf();
+
+        let note = g.finalize().await.unwrap();
+        assert!(note.is_none(), "no changes → no note");
+        assert!(!wt.exists());
+        assert!(!branch_list(repo.path()).contains("roger/_empty_s/"), "empty branch should be deleted");
     }
 }

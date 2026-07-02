@@ -80,6 +80,16 @@ profile = "fast"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/narfman0/notes"]
 # enabled = true
 
+# Git-worktree isolation for agentic subprocess jobs. When enabled (default) and the
+# workdir is a git repo, each job runs in a throwaway worktree on a fresh branch —
+# the live checkout is never touched. Changes are committed to that branch and
+# surfaced in the reply (🌿 branch + diffstat) for you to review/merge; the worktree
+# is then removed. Set enabled = false to run agents directly in the workdir.
+[worktrees]
+enabled = true
+# base_dir = "~/.roger/worktrees"   # default
+branch_prefix = "roger"
+
 # comms = sync | async | auto. sync awaits inline; async acks + runs in the
 # background; auto starts inline and promotes to background past sync_budget_ms.
 [comms]
