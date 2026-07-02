@@ -293,6 +293,19 @@ async fn main() -> Result<()> {
     client.add_event_handler(matrix::handler::handle_invite);
     client.add_event_handler(matrix::handler::handle_message);
 
+    // Publish m.room.bot.options to all already-joined rooms so clients that
+    // support it show command hints without needing a fresh invite.
+    {
+        let c = client.clone();
+        tokio::spawn(async move {
+            // Brief delay to let the initial sync complete before sending state events.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            for room in c.joined_rooms() {
+                matrix::handler::publish_bot_options(&room).await;
+            }
+        });
+    }
+
     info!("sync loop starting");
     client.sync(SyncSettings::default()).await?;
 

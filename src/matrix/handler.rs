@@ -245,9 +245,40 @@ pub async fn handle_invite(
         info!("accepting invite to allowed room {}", room_id);
         if let Err(e) = room.join().await {
             warn!("failed to join room {}: {}", room_id, e);
+        } else {
+            // Advertise bot commands to clients that support m.room.bot.options
+            // (Fractal, some others — Element Web uses its own command registry).
+            publish_bot_options(&room).await;
         }
     } else {
         warn!("declining invite to non-allowlisted room {}", room_id);
+    }
+}
+
+/// Send an `m.room.bot.options` state event advertising Roger's slash commands.
+/// This is a best-effort hint; clients that don't support it ignore the event.
+pub async fn publish_bot_options(room: &Room) {
+    let commands = serde_json::json!({
+        "help":           {"description": "Show command reference"},
+        "status":         {"description": "Uptime, model, history stats, active jobs"},
+        "jobs":           {"description": "List background jobs"},
+        "model":          {"description": "Show or switch LLM profile for this room"},
+        "cancel":         {"description": "Abort a background job (/cancel <id>)"},
+        "clear":          {"description": "Wipe conversation history for this room"},
+        "forget":         {"description": "Wipe durable memory (/forget global for shared)"},
+        "agents":         {"description": "List configured subagents"},
+        "agent":          {"description": "Run a subagent (/agent <name> <task>)"},
+        "skills":         {"description": "List active + pending skills"},
+        "skills suggest": {"description": "Draft a skill from recent history"},
+        "skills approve": {"description": "Promote a pending skill (/skills approve <name>)"},
+        "skills forget":  {"description": "Remove a skill (/skills forget <name>)"}
+    });
+    let content = serde_json::json!({
+        "prefix": "/",
+        "commands": commands
+    });
+    if let Err(e) = room.send_state_event_raw("m.room.bot.options", "", content).await {
+        warn!("failed to publish m.room.bot.options: {}", e);
     }
 }
 
