@@ -741,16 +741,34 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
     match cmd.as_str() {
         "/help" => Some(
             "**Roger commands**\n\
-             `/help` — show this list\n\
-             `/clear` — wipe conversation history for this room\n\
-             `/forget` — wipe this room's durable memory (`/forget global` for shared)\n\
-             `/status` — show uptime, model, and history stats\n\
-             `/model [name]` — show/switch this room's LLM profile (`/model reset` to revert)\n\
-             `/jobs` — list active background jobs\n\
-             `/cancel <id>` — cancel a running background job\n\
+             \n\
+             **Info**\n\
+             `/status` — uptime, model, history stats, active jobs\n\
+             `/jobs` — list background jobs with room and elapsed time\n\
+             \n\
+             **Config**\n\
+             `/model [name]` — show or switch this room's LLM profile\n\
+             `/model reset` — revert to the room's default profile\n\
+             \n\
+             **Jobs**\n\
+             `/cancel <id>` — abort a background job (see `/jobs`)\n\
+             \n\
+             **Memory**\n\
+             `/clear` — wipe this room's conversation history\n\
+             `/forget` — wipe this room's durable memory\n\
+             `/forget global` — wipe the shared global memory\n\
+             \n\
+             **Agents**\n\
              `/agents` — list configured subagents\n\
-             `/agent <name> <task>` — run a subagent on a task\n\
-             `/skills [approve|forget <name>|suggest]` — list/manage skills"
+             `/agent <name> <task>` — run a named subagent manually\n\
+             \n\
+             **Skills**\n\
+             `/skills` — list active + pending skills\n\
+             `/skills suggest` — draft a new skill from recent history\n\
+             `/skills approve <name>` — promote a pending skill to active\n\
+             `/skills forget <name>` — remove a learned or pending skill\n\
+             \n\
+             `/help` — show this message"
                 .to_string(),
         ),
         "/clear" => {
