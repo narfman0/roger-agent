@@ -237,26 +237,39 @@ cancelled before finalize. Non-git workdirs fall back to running directly in the
 workdir. Net effect: agent edits land on a branch for review/merge; the running
 deployment is never modified out from under itself.
 
-## Orchestrator: comms modes
+## Orchestrator: per-room queue + comms modes
+
+Each room is a **serial FIFO worker** (`RoomQueues` / `room_worker`). `handle_message`
+is a thin entry: it resolves the body (text, or audio transcription), answers control
+slash commands *immediately* (bypassing the queue, so `/cancel`/`/status` work during
+a job), and otherwise **enqueues** the turn to the room's worker. The worker pulls
+turns in arrival order and runs `process_turn` one at a time — so replies and history
+stay ordered within a room. Rooms run independently of each other.
 
 The whole response pipeline for a turn (produce → stream → fallback → metrics →
 history append → final render) runs as **one self-contained task**
-(`run_response_job`), so it is correct whether the handler awaits or detaches it.
-Each profile has a `comms` mode (`ReloadableState::comms_mode_for_profile`):
+(`run_response_job`). The room worker either **holds** the room until it finishes or
+**releases** the room the moment the task detaches, per the profile's `comms` mode
+(`ReloadableState::comms_mode_for_profile`):
 
-- `sync` — handler awaits the task (typing indicator, streamed edits).
-- `async` — the handler registers the task and returns immediately; it streams its
-  reply into a message (posted on the first content flush) while the user keeps
-  chatting.
-- `auto` — `select!` the task against `sleep(sync_budget_ms)`; if the budget fires
-  first, detach silently and let the task finish in the background.
+- `sync` — the worker awaits the task; subsequent turns in the room **wait**.
+- `async` — the worker detaches immediately and advances to the next turn while the
+  task streams its reply in the background.
+- `auto` — `select!` the task against `sleep(sync_budget_ms)`; on timeout it detaches
+  and the room advances.
 
-No mode posts a placeholder — the Matrix typing indicator is the only "working"
-signal until the response message appears.
+So **sync blocks the room; background work releases it.** No mode posts a placeholder
+— the typing indicator is the only "working" signal until the reply appears.
 
-Background jobs live in a `Workers` registry (`src/workers.rs`) in `BotCtx`: a
-job id → handle map with abort handles. It powers `/status` (active count),
-`/jobs` (list), `/cancel <id>` (abort → kill the subprocess tree), a soft cap
-warning (`soft_worker_cap`), and per-room serialization of agentic jobs (one
-subprocess per room workdir at a time). Flush cadence comes from the reloadable
+Agentic (subprocess) turns additionally serialize per room via a per-room **agentic
+slot** (`Semaphore(1)`): a turn acquires the permit (waiting, FIFO, behind any running
+agentic job) and moves it into the job, which holds it for its whole lifetime — so a
+backgrounded coding job keeps the slot until done and the next agentic turn queues,
+while non-agentic chats still flow past it. Now that jobs run in isolated worktrees,
+this is about ordering, not workdir safety.
+
+Background jobs live in a `Workers` registry (`src/workers.rs`) in `BotCtx`: a job
+id → handle map with abort handles, powering `/status` (active count), `/jobs`
+(list, with room), `/cancel <id>` (abort → kill the subprocess tree), and a soft-cap
+warning (`soft_worker_cap`). Flush cadence comes from the reloadable
 `CommsConfig::edit_debounce_ms`.

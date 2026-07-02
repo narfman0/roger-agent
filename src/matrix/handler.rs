@@ -33,7 +33,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -203,6 +203,8 @@ pub struct BotCtx {
     pub room_workdirs: Arc<RoomWorkdirStore>,
     /// Durable memory files (global + per-room), injected into the system prompt.
     pub memory: Arc<MemoryStore>,
+    /// Per-room FIFO workers that serialize turns within each room.
+    pub rooms: Arc<RoomQueues>,
 }
 
 impl BotCtx {
@@ -238,6 +240,45 @@ pub async fn handle_invite(
     }
 }
 
+/// One queued user turn awaiting its room's serial worker.
+struct Turn {
+    room: Room,
+    sender: String,
+    body: String,
+}
+
+/// Per-room FIFO workers. Each room has a single spawned worker that processes its
+/// turns in arrival order: sync work holds the room until it completes; async /
+/// auto-promoted work detaches and lets the room advance to the next turn. Control
+/// slash commands bypass this queue (handled directly in `handle_message`).
+#[derive(Default)]
+pub struct RoomQueues {
+    senders: std::sync::Mutex<HashMap<String, mpsc::UnboundedSender<Turn>>>,
+}
+
+impl RoomQueues {
+    fn enqueue(&self, ctx: &BotCtx, room_id: String, turn: Turn) {
+        let mut map = self.senders.lock().unwrap();
+        let tx = map.entry(room_id.clone()).or_insert_with(|| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tokio::spawn(room_worker(rx, ctx.clone()));
+            tx
+        });
+        let _ = tx.send(turn);
+    }
+}
+
+/// A room's serial worker: pulls turns in order and processes them one at a time.
+async fn room_worker(mut rx: mpsc::UnboundedReceiver<Turn>, ctx: BotCtx) {
+    // One "agentic slot" per room: an agentic turn waits here until any running
+    // agentic job in the room finishes (FIFO), while a backgrounded job holds the
+    // permit for its lifetime.
+    let agentic_gate = Arc::new(Semaphore::new(1));
+    while let Some(turn) = rx.recv().await {
+        process_turn(&ctx, &agentic_gate, turn).await;
+    }
+}
+
 pub async fn handle_message(
     event: OriginalSyncRoomMessageEvent,
     room: Room,
@@ -253,7 +294,7 @@ pub async fn handle_message(
         return;
     }
 
-    // Resolve message body — text directly, audio via transcription
+    // Resolve message body — text directly, audio via transcription.
     let body = match &event.content.msgtype {
         MessageType::Text(text) => text.body.clone(),
 
@@ -278,7 +319,33 @@ pub async fn handle_message(
         _ => return,
     };
 
-    // Mention gate — read the (reloadable) per-room config
+    // Control slash commands bypass the room queue (so `/cancel`, `/status`, etc.
+    // respond immediately during a running job) and the mention gate.
+    if body.trim_start().starts_with('/') {
+        if let Some(cmd_reply) = handle_slash_command(&body, &room_id, &ctx).await {
+            if let Err(e) = room.send(RoomMessageEventContent::text_plain(&cmd_reply)).await {
+                warn!("failed to send command reply: {}", e);
+            }
+        }
+        return;
+    }
+
+    // Everything else goes onto the room's serial worker, preserving order.
+    let bot = &*ctx;
+    bot.rooms.enqueue(
+        bot,
+        room_id,
+        Turn { room, sender: event.sender.to_string(), body },
+    );
+}
+
+/// Process one queued turn for a room: mention gate, persist, assemble context, and
+/// dispatch the response job holding vs. releasing the room per the comms mode.
+async fn process_turn(ctx: &BotCtx, agentic_gate: &Arc<Semaphore>, turn: Turn) {
+    let Turn { room, sender, body } = turn;
+    let room_id = room.room_id().to_string();
+
+    // Mention gate — read the (reloadable) per-room config.
     let require_mention = ctx
         .state
         .read()
@@ -291,15 +358,7 @@ pub async fn handle_message(
         return;
     }
 
-    info!(room = %room_id, sender = %event.sender, "processing: {}", body);
-
-    // Handle slash commands without touching the LLM — reply directly, no placeholder.
-    if let Some(cmd_reply) = handle_slash_command(&body, &room_id, &ctx).await {
-        if let Err(e) = room.send(RoomMessageEventContent::text_plain(&cmd_reply)).await {
-            warn!("failed to send command reply: {}", e);
-        }
-        return;
-    }
+    info!(room = %room_id, sender = %sender, "processing: {}", body);
 
     // Persist the user turn, then snapshot the reloadable bits and drop the read
     // lock before spawning the (possibly long) response job so SIGHUP reloads
@@ -339,17 +398,7 @@ pub async fn handle_message(
         &memory_room,
     );
 
-    // Serialize agentic jobs per room — two agents in one working directory clash.
     let agentic = llm.is_subprocess();
-    if agentic && ctx.workers.agentic_active_in_room(&room_id) {
-        let _ = room
-            .send(RoomMessageEventContent::text_plain(
-                "I'm already running a job in this room. Use `/cancel <id>` or wait for it to finish.",
-            ))
-            .await;
-        return;
-    }
-
     let budget = llm.history_token_budget(crate::history::estimate_tokens(&system_prompt));
     let mut messages = vec![ChatMessage::system(&system_prompt)];
     messages.extend(ctx.history.windowed_by_tokens(&room_id, budget));
@@ -364,25 +413,33 @@ pub async fn handle_message(
 
     let flush = FlushCadence::from_comms(&comms_cfg);
 
+    // Agentic serialization: an agentic turn waits here (holding the room) until the
+    // room's agentic slot is free — i.e. behind any still-running agentic job. The
+    // permit is moved into the job and held for its whole lifetime, so a backgrounded
+    // (async) job keeps the slot until it finishes and the next agentic turn queues.
+    let agentic_permit = if agentic {
+        Some(agentic_gate.clone().acquire_owned().await.expect("agentic gate open"))
+    } else {
+        None
+    };
+
     // The whole response pipeline runs as one self-contained task (produce →
-    // stream → fallback → metrics → history → final render). The handler then
-    // either awaits it (sync), detaches it (async), or races it against the sync
-    // budget and promotes it to the background on timeout (auto). In every mode
-    // the typing indicator is the only "working" signal — no placeholder message;
-    // the response message appears on the first content flush.
+    // stream → fallback → metrics → history → final render). The room worker then
+    // awaits it (sync), detaches it (async), or races it against the sync budget and
+    // detaches on timeout (auto) — releasing the room to the next turn once detached.
     let job_id = ctx.workers.insert_pending(JobHandle {
         room: room_id.clone(),
         profile: profile.clone(),
         model: model.clone(),
         started: Instant::now(),
-        agentic,
         abort: None,
     });
     let workers = ctx.workers.clone();
-    let bot = (*ctx).clone();
+    let bot = ctx.clone();
     let job = {
         let room = room.clone();
         tokio::spawn(async move {
+            let _agentic_permit = agentic_permit; // held for the job's whole lifetime
             run_response_job(room, room_id, messages, llm, bot, profile, model, flush, workdir)
                 .await;
             workers.remove(job_id);
@@ -391,14 +448,14 @@ pub async fn handle_message(
     ctx.workers.set_abort(job_id, job.abort_handle());
 
     match comms_mode {
-        // Detached: the job owns its message and lifecycle from here.
+        // Detached: the job owns its message and lifecycle; the room advances now.
         CommsMode::Async => {}
         CommsMode::Sync => {
             let _ = job.await;
         }
         CommsMode::Auto => {
-            // Await up to the sync budget; if it runs long, detach silently and let
-            // the job finish in the background (typing indicator covers the wait).
+            // Hold the room up to the sync budget; if it runs long, detach and let
+            // the job finish in the background (the room advances to the next turn).
             let sync_budget = Duration::from_millis(comms_cfg.sync_budget_ms);
             tokio::pin!(job);
             tokio::select! {
@@ -632,9 +689,11 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
             } else {
                 let mut out = String::from("**Active jobs**\n");
                 for j in jobs {
+                    // Short room tag (localpart before ':').
+                    let room_tag = j.room.trim_start_matches('!').split(':').next().unwrap_or(&j.room);
                     out.push_str(&format!(
-                        "`{}` — {} ({}), {}s\n",
-                        j.id, j.profile, j.model, j.elapsed_secs
+                        "`{}` — {} ({}) in {}, {}s\n",
+                        j.id, j.profile, j.model, room_tag, j.elapsed_secs
                     ));
                 }
                 out.push_str("`/cancel <id>` to stop one.");
@@ -848,6 +907,7 @@ mod tests {
             workers: Arc::new(Workers::new(4)),
             room_workdirs: Arc::new(RoomWorkdirStore::load(dir.path().join("rw.json"))),
             memory: Arc::new(MemoryStore::new(dir.path(), None)),
+            rooms: Arc::new(RoomQueues::default()),
         }
     }
 

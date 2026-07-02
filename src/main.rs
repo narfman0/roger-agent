@@ -267,6 +267,7 @@ async fn main() -> Result<()> {
         workers,
         room_workdirs,
         memory,
+        rooms: Arc::new(matrix::handler::RoomQueues::default()),
     };
 
     client.add_event_handler_context(bot_ctx);

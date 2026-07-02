@@ -15,8 +15,6 @@ pub struct JobHandle {
     pub profile: String,
     pub model: String,
     pub started: Instant,
-    /// Whether this job runs an agentic subprocess (for per-room serialization).
-    pub agentic: bool,
     /// Set shortly after spawn; `None` only during the brief insert→spawn window.
     pub abort: Option<AbortHandle>,
 }
@@ -24,6 +22,7 @@ pub struct JobHandle {
 /// A point-in-time view of one active job for display.
 pub struct JobInfo {
     pub id: u64,
+    pub room: String,
     pub profile: String,
     pub model: String,
     pub elapsed_secs: u64,
@@ -68,15 +67,6 @@ impl Workers {
         self.jobs.lock().unwrap().remove(&id);
     }
 
-    /// True if the room already has an active agentic (subprocess) job.
-    pub fn agentic_active_in_room(&self, room: &str) -> bool {
-        self.jobs
-            .lock()
-            .unwrap()
-            .values()
-            .any(|j| j.agentic && j.room == room)
-    }
-
     pub fn count(&self) -> usize {
         self.jobs.lock().unwrap().len()
     }
@@ -99,6 +89,7 @@ impl Workers {
             .iter()
             .map(|(&id, j)| JobInfo {
                 id,
+                room: j.room.clone(),
                 profile: j.profile.clone(),
                 model: j.model.clone(),
                 elapsed_secs: j.started.elapsed().as_secs(),
@@ -113,13 +104,12 @@ impl Workers {
 mod tests {
     use super::*;
 
-    fn handle(room: &str, agentic: bool) -> JobHandle {
+    fn handle(room: &str) -> JobHandle {
         JobHandle {
             room: room.into(),
             profile: "p".into(),
             model: "m".into(),
             started: Instant::now(),
-            agentic,
             abort: None,
         }
     }
@@ -127,24 +117,12 @@ mod tests {
     #[test]
     fn ids_increase_and_count_tracks() {
         let w = Workers::new(4);
-        let a = w.insert_pending(handle("!r:s", false));
-        let b = w.insert_pending(handle("!r:s", false));
+        let a = w.insert_pending(handle("!r:s"));
+        let b = w.insert_pending(handle("!r:s"));
         assert!(b > a);
         assert_eq!(w.count(), 2);
         w.remove(a);
         assert_eq!(w.count(), 1);
-    }
-
-    #[test]
-    fn agentic_serialization_is_per_room() {
-        let w = Workers::new(4);
-        w.insert_pending(handle("!coding:s", true));
-        assert!(w.agentic_active_in_room("!coding:s"));
-        assert!(!w.agentic_active_in_room("!other:s"));
-        // A non-agentic job doesn't count as an agentic occupant.
-        let w2 = Workers::new(4);
-        w2.insert_pending(handle("!coding:s", false));
-        assert!(!w2.agentic_active_in_room("!coding:s"));
     }
 
     #[test]
@@ -156,7 +134,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_aborts_the_task() {
         let w = Workers::new(4);
-        let id = w.insert_pending(handle("!r:s", true));
+        let id = w.insert_pending(handle("!r:s"));
         let task = tokio::spawn(async {
             // Long enough that it won't finish on its own during the test.
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
