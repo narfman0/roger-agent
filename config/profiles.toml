@@ -26,8 +26,8 @@ idle_timeout_ms = 180000
 # Subprocess controls (claude-code/opencode only):
 # bypassPermissions = full autonomy incl. shell; acceptEdits = file edits only, no bash.
 permission_mode = "bypassPermissions"
-# max_budget_usd = 2.0            # cost guard per turn (--max-budget-usd)
-# max_turns = 30                  # agentic-turn cap (--max-turns)
+max_budget_usd = 2.0
+max_turns = 30
 
 [profiles.reason]
 backend = "local-small"      # gemma via Ollama (local)
@@ -45,6 +45,8 @@ backend = "opencode-local"
 comms = "async"
 idle_timeout_ms = 180000
 permission_mode = "bypassPermissions"
+max_budget_usd = 2.0
+max_turns = 30
 
 # Operating instructions layered into every room's system prompt (read fresh each
 # turn — edits apply without a reload). A room may add its own via
