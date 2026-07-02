@@ -18,6 +18,12 @@ master, green build + tests, per `AGENTS.md`.
 | 5.2 | MCP client support (finish `rmcp` WIP) | ✅ Done |
 | 5.3 | Named / custom-configured subagents | ✅ Done |
 | 5.4 | Self-improving skills (author + suggest) | ✅ Done |
+| 5.5 | Per-room FIFO scheduling (sync holds / async releases; agentic slot) | ✅ Done |
+
+**Phase 5 complete.** Shipped behaviour is documented in `docs/architecture.md`
+(Orchestrator, Tools & MCP, Subagents, Skills, Worktree isolation). Still deferred:
+session-mapped subprocess continuity (`--session-id`), tool-step progress markers, a
+typing keepalive for long jobs, and a nightly compaction sweep.
 
 ---
 
@@ -176,4 +182,3 @@ UX (chat commands vs. edit files directly).
 - **Deferred earlier, still open:** session-mapped continuity for subprocess
   backends (`--session-id`), tool-step progress markers, a typing keepalive for long
   jobs, and a nightly compaction sweep.
-</content>

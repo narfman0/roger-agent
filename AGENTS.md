@@ -1,6 +1,10 @@
 # AGENTS.md
 
-Rust Matrix bot that responds to messages in allowlisted rooms using configurable LLM backends.
+Rust Matrix-native agent/orchestrator: it answers in allowlisted rooms via
+configurable LLM backends (HTTP + agentic claude-code/opencode subprocesses),
+routes per room, injects operating instructions + durable memory, auto-compacts
+history, delegates to named subagents, exposes MCP + skills, and isolates agentic
+edits in git worktrees.
 
 ## Workflow
 
@@ -11,15 +15,20 @@ asked. Build + test before each commit. Push when a unit of work is done.
 
 | File | Purpose |
 |------|---------|
-| `src/main.rs` | Entry point, wires all components together |
-| `src/config.rs` | Config loading: profiles.toml + backends.<HOST_ROLE>.toml + .env |
+| `src/main.rs` | Entry point; resolves `~/.roger` state dir, wires everything |
+| `src/config.rs` | Config loading + all `[section]` structs; `build_client` (kind dispatch) |
 | `src/llm.rs` | `Backend` enum (HTTP / subprocess) + `ProfileLlm` fallback chains |
-| `src/subprocess.rs` | Agentic subprocess backends (claude-code, opencode): spawn, JSON parse, lifecycle |
-| `src/workers.rs` | Background-job registry (sync/async/auto), `/jobs` + `/cancel` |
-| `src/history.rs` | Per-room conversation history, JSON-backed on disk |
+| `src/subprocess.rs` | Agentic subprocess backends (claude-code, opencode) + worktree isolation |
+| `src/matrix/handler.rs` | Per-room FIFO workers, orchestrator (sync/async/auto), subagents, slash commands |
+| `src/workers.rs` | Background-job registry, `/jobs` + `/cancel` |
+| `src/tools.rs` | Native tools + dynamic registry (`SubagentHost`, MCP, skills) |
+| `src/mcp.rs` | MCP client manager (`rmcp`): connect servers, route `mcp__*` tools |
+| `src/memory.rs` / `src/compaction.rs` | Two-tier durable memory; size-triggered compaction |
+| `src/skills.rs` | Reusable skills (committed + learned, approval-gated) |
+| `src/history.rs` | Per-room history (JSON) + atomic rewrite + per-room lock |
+| `src/room_workdirs.rs` | Per-room agentic workdir selections (`set_workdir`) |
 | `src/audio.rs` | Speaches/Whisper audio transcription client |
 | `src/matrix/client.rs` | Matrix client build + session persistence |
-| `src/matrix/handler.rs` | Event handlers: invite, message, ack+edit flow |
 
 ## Build and test
 
@@ -58,20 +67,23 @@ Config hot-reload.
 
 ## Config
 
-- `config/profiles.toml` — committed: LLM profiles, comms budgets, projects, rooms
+- `config/profiles.toml` — committed: profiles, comms, `[mcp]`, `[worktrees]`,
+  `[agents]`, `[context]`, `[memory]`, `[compaction]`, `[projects]`, rooms
 - `config/backends.<HOST_ROLE>.toml` — **gitignored**: backend kinds, URLs, api_key_env names
+- `config/operating.md`, `config/skills/` — committed operating instructions + seed skills
 - `.env` — **gitignored**: Matrix credentials + gateway key
 
 Never commit `.env` or `backends.*.toml` (except `backends.example.toml`).
 
 ## Message / streaming flow
 
-1. Typing indicator sent — the only "working" signal; no placeholder in any mode.
-2. The response pipeline runs as one self-contained task; the handler awaits it
-   (sync), detaches it (async), or promotes it past the sync budget (auto). Output
-   is flushed (first post, then in-place `m.replace` edits) on sentence boundaries
-   or a debounce ceiling.
-3. See `docs/architecture.md` → Response UX and Orchestrator for the full flow.
+1. `handle_message` is a thin entry: resolve body (text/audio), answer control slash
+   commands immediately, else **enqueue** to the room's serial FIFO worker.
+2. The worker runs one turn at a time via `process_turn`; the response pipeline is
+   one self-contained task the worker **holds** (sync) or **releases** (async /
+   auto-promoted). Output flushes (first post, then `m.replace` edits) on sentence
+   boundaries or a debounce ceiling; no placeholder in any mode.
+3. See `docs/architecture.md` → Orchestrator (per-room queue) for the full flow.
 
 ## Adding a new backend kind
 
