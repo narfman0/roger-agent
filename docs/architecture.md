@@ -162,6 +162,22 @@ calls `metrics.record(latency_ms, ok)` and emits a structured log line
 sink doubles as a metrics scrape source. Live totals are shown in `/status`.
 Counters reset on restart.
 
+## Tools & MCP
+
+HTTP backends run a tool loop; the advertised tool list is dynamic, owned by
+`ToolExecutor::tool_definitions()` (native tools + MCP), and `chat_with_tools`
+pulls it from the executor rather than a static list. Native tools: `web_search`,
+`web_fetch`, `read_file`, `write_file`, `list_dir`, `set_workdir`.
+
+MCP servers (`src/mcp.rs`, `[mcp.servers.<name>]`) are connected as stdio child
+processes at startup via `rmcp` and kept alive for the process lifetime (restart to
+change — not hot-reloaded). Their tools are advertised namespaced
+`mcp__<server>__<tool>`; `ToolExecutor::execute` routes those calls back to the
+owning server (`McpManager::call`) and flattens the result's text content. A failed
+server is logged and skipped, never blocking startup. `/status` shows connected
+server + tool counts. Subprocess backends (claude-code/opencode) get MCP via their
+own config, not this manager.
+
 ## Backend kinds
 
 A profile's chain is built from named backends, dispatched on `kind`

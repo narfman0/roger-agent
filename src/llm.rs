@@ -184,7 +184,7 @@ impl LlmClient {
                 max_tokens: self.max_tokens,
                 temperature: self.temperature,
                 stream: false,
-                tools: Some(tool_definitions()),
+                tools: Some(exec.tool_definitions()),
             };
 
             let mut req = self.http.post(&url).json(&body);

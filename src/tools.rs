@@ -1,3 +1,4 @@
+use crate::mcp::McpManager;
 use crate::room_workdirs::RoomWorkdirStore;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -151,6 +152,8 @@ pub struct ToolExecutor {
     projects: HashMap<String, String>,
     /// Persists per-room workdir selections; shared with the handler.
     room_workdirs: Option<Arc<RoomWorkdirStore>>,
+    /// Connected MCP servers whose tools are also exposed to the model.
+    mcp: Option<Arc<McpManager>>,
 }
 
 impl ToolExecutor {
@@ -158,6 +161,7 @@ impl ToolExecutor {
         searxng_url: Option<String>,
         projects: HashMap<String, String>,
         room_workdirs: Option<Arc<RoomWorkdirStore>>,
+        mcp: Option<Arc<McpManager>>,
     ) -> Self {
         ToolExecutor {
             http: Client::builder()
@@ -168,7 +172,26 @@ impl ToolExecutor {
             searxng_url,
             projects,
             room_workdirs,
+            mcp,
         }
+    }
+
+    /// Connected MCP servers + total MCP tools (for `/status`).
+    pub fn mcp_summary(&self) -> (usize, usize) {
+        self.mcp.as_ref().map_or((0, 0), |m| m.summary())
+    }
+
+    /// The full tool list advertised to the model: roger's native tools plus any
+    /// connected MCP server tools.
+    pub fn tool_definitions(&self) -> Value {
+        let mut defs = match tool_definitions() {
+            Value::Array(a) => a,
+            _ => Vec::new(),
+        };
+        if let Some(mcp) = &self.mcp {
+            defs.extend(mcp.tool_definitions());
+        }
+        Value::Array(defs)
     }
 
     pub async fn execute(&self, call: &ToolCall) -> String {
@@ -177,6 +200,13 @@ impl ToolExecutor {
             Ok(v) => v,
             Err(e) => return format!("error: bad arguments: {}", e),
         };
+
+        if McpManager::handles(&call.function.name) {
+            return match &self.mcp {
+                Some(mcp) => mcp.call(&call.function.name, args).await,
+                None => "error: MCP is not configured".to_string(),
+            };
+        }
 
         match call.function.name.as_str() {
             "web_search" => {
@@ -554,7 +584,7 @@ mod tests {
         let store = Arc::new(RoomWorkdirStore::load(dir.path().join("rw.json")));
         let mut projects = HashMap::new();
         projects.insert("foo".to_string(), "/tmp/foo".to_string());
-        let exec = ToolExecutor::with_projects(None, projects, Some(store.clone()));
+        let exec = ToolExecutor::with_projects(None, projects, Some(store.clone()), None);
 
         let out = ROOM_ID
             .scope("!room:s".to_string(), exec.execute(&workdir_call("foo")))
@@ -567,13 +597,20 @@ mod tests {
     async fn set_workdir_unknown_project_errors() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(RoomWorkdirStore::load(dir.path().join("rw.json")));
-        let exec = ToolExecutor::with_projects(None, HashMap::new(), Some(store.clone()));
+        let exec = ToolExecutor::with_projects(None, HashMap::new(), Some(store.clone()), None);
 
         let out = ROOM_ID
             .scope("!room:s".to_string(), exec.execute(&workdir_call("bar")))
             .await;
         assert!(out.starts_with("error: unknown project"), "got: {}", out);
         assert!(store.get("!room:s").is_none());
+    }
+
+    #[test]
+    fn executor_tool_definitions_returns_native_without_mcp() {
+        let exec = ToolExecutor::with_projects(None, HashMap::new(), None, None);
+        let arr = exec.tool_definitions();
+        assert_eq!(arr.as_array().unwrap().len(), 6);
     }
 
     #[test]

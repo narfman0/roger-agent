@@ -4,6 +4,7 @@ mod config;
 mod history;
 mod llm;
 mod matrix;
+mod mcp;
 mod memory;
 mod metrics;
 mod room_profiles;
@@ -170,11 +171,19 @@ async fn main() -> Result<()> {
         info!("projects: {}", projects.keys().cloned().collect::<Vec<_>>().join(", "));
     }
 
-    // Build tool executor (web_search, web_fetch, set_workdir)
+    // Connect MCP servers (once at startup; restart to change them).
+    let mcp = Arc::new(mcp::McpManager::connect(&cfg.mcp.servers).await);
+    if !mcp.is_empty() {
+        let (servers, tools) = mcp.summary();
+        info!("mcp: {} server(s), {} tool(s)", servers, tools);
+    }
+
+    // Build tool executor (web_search, web_fetch, set_workdir, MCP tools)
     let tool_executor = Arc::new(tools::ToolExecutor::with_projects(
         cfg.searxng_url.clone(),
         projects,
         Some(room_workdirs.clone()),
+        Some(mcp.clone()),
     ));
     if let Some(url) = &cfg.searxng_url {
         info!("searxng: {} (web_search enabled)", url);

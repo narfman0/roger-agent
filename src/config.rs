@@ -258,11 +258,32 @@ impl Default for CompactionConfig {
     }
 }
 
+/// A single MCP server roger connects to as a client (stdio child process).
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// MCP client config: named servers whose tools are exposed to the HTTP models.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub servers: HashMap<String, McpServerConfig>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ProfilesFile {
     profiles: HashMap<String, ProfileConfig>,
     #[serde(default)]
     comms: Option<CommsConfig>,
+    #[serde(default)]
+    mcp: Option<McpConfig>,
     #[serde(default)]
     context: Option<ContextConfig>,
     #[serde(default)]
@@ -289,6 +310,7 @@ pub struct Config {
     pub context: ContextConfig,
     pub memory: MemoryConfig,
     pub compaction: CompactionConfig,
+    pub mcp: McpConfig,
     pub rooms: HashMap<String, RoomConfig>,
     /// Known projects (name → path) selectable via the `set_workdir` tool.
     pub projects: HashMap<String, String>,
@@ -358,6 +380,7 @@ impl Config {
             context: profiles_file.context.unwrap_or_default(),
             memory: profiles_file.memory.unwrap_or_default(),
             compaction: profiles_file.compaction.unwrap_or_default(),
+            mcp: profiles_file.mcp.unwrap_or_default(),
             rooms,
             projects: profiles_file.projects,
             matrix_homeserver,

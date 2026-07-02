@@ -13,9 +13,9 @@ master, green build + tests, per `AGENTS.md`.
 
 | # | Task | Status |
 |---|------|--------|
-| 5.0 | Dynamic tool registry (shared prerequisite) | 📋 planned |
+| 5.0 | Dynamic tool registry (shared prerequisite) | ✅ Done |
 | 5.1 | Worktree isolation for agentic jobs | 📋 planned |
-| 5.2 | MCP client support (finish `rmcp` WIP) | 📋 planned |
+| 5.2 | MCP client support (finish `rmcp` WIP) | ✅ Done |
 | 5.3 | Named / custom-configured subagents | 📋 planned |
 | 5.4 | Self-improving skills (author + suggest) | 📋 planned |
 

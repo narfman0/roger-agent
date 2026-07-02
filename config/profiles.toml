@@ -72,6 +72,14 @@ trigger_fraction = 0.8   # e.g. ~51k for a 64k window
 keep_recent_turns = 8
 profile = "fast"
 
+# MCP servers roger connects to as a client (stdio child process). Their tools are
+# exposed to the HTTP models as mcp__<server>__<tool>. Connected once at startup
+# (restart to change). Server names must not contain '__'. Example:
+# [mcp.servers.filesystem]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/narfman0/notes"]
+# enabled = true
+
 # comms = sync | async | auto. sync awaits inline; async acks + runs in the
 # background; auto starts inline and promotes to background past sync_budget_ms.
 [comms]

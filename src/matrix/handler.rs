@@ -615,10 +615,12 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
             } else {
                 client.model().to_string()
             };
+            let (mcp_servers, mcp_tools) = ctx.tool_executor.mcp_summary();
             Some(format!(
-                "**Roger status**\nUptime: {}h {}m {}s\nProfile: {} ({})\nHistory: {} messages (this room)\nMemory: {}t global, {}t this room\nRequests: {} ({} errors), avg {}ms\nActive jobs: {}",
+                "**Roger status**\nUptime: {}h {}m {}s\nProfile: {} ({})\nHistory: {} messages (this room)\nMemory: {}t global, {}t this room\nMCP: {} server(s), {} tool(s)\nRequests: {} ({} errors), avg {}ms\nActive jobs: {}",
                 h, m, s, profile, model_desc, history_len,
                 ctx.memory.global_tokens(), ctx.memory.room_tokens(room_id),
+                mcp_servers, mcp_tools,
                 m_snap.requests, m_snap.errors, m_snap.avg_latency_ms,
                 ctx.workers.count()
             ))
@@ -842,7 +844,7 @@ mod tests {
             state: Arc::new(RwLock::new(state())),
             room_profiles: Arc::new(RoomProfileStore::new(dir.path().join("rp.json"))),
             metrics: Arc::new(Metrics::default()),
-            tool_executor: Arc::new(ToolExecutor::with_projects(None, HashMap::new(), None)),
+            tool_executor: Arc::new(ToolExecutor::with_projects(None, HashMap::new(), None, None)),
             workers: Arc::new(Workers::new(4)),
             room_workdirs: Arc::new(RoomWorkdirStore::load(dir.path().join("rw.json"))),
             memory: Arc::new(MemoryStore::new(dir.path(), None)),
