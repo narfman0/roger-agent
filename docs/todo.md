@@ -17,7 +17,7 @@ master, green build + tests, per `AGENTS.md`.
 | 5.1 | Worktree isolation for agentic jobs | ✅ Done |
 | 5.2 | MCP client support (finish `rmcp` WIP) | ✅ Done |
 | 5.3 | Named / custom-configured subagents | ✅ Done |
-| 5.4 | Self-improving skills (author + suggest) | 📋 planned |
+| 5.4 | Self-improving skills (author + suggest) | ✅ Done |
 
 ---
 

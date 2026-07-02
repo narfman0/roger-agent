@@ -7,6 +7,7 @@ use crate::{
     metrics::Metrics,
     room_profiles::RoomProfileStore,
     room_workdirs::RoomWorkdirStore,
+    skills::SkillStore,
     subprocess::WORKDIR,
     tools::{SubagentHost, ToolExecutor, ROOM_ID, SUBAGENT},
     workers::{JobHandle, Workers},
@@ -87,12 +88,14 @@ fn read_context_file(path: &str) -> String {
 
 /// Layer operating instructions and durable memory onto the base persona to form
 /// the full system prompt. Empty sections are skipped, so absent files add nothing.
+#[allow(clippy::too_many_arguments)]
 fn assemble_system_prompt(
     base: &str,
     operating_global: &str,
     operating_room: &str,
     memory_global: &str,
     memory_room: &str,
+    skills: &str,
 ) -> String {
     let mut out = base.trim_end().to_string();
     let mut section = |title: Option<&str>, body: &str| {
@@ -110,6 +113,10 @@ fn assemble_system_prompt(
     section(None, operating_room);
     section(Some("## Memory (global)"), memory_global);
     section(Some("## Memory (this room)"), memory_room);
+    section(
+        Some("## Skills\nReusable procedures — call `read_skill(name)` to load one:"),
+        skills,
+    );
     out
 }
 
@@ -207,6 +214,8 @@ pub struct BotCtx {
     pub memory: Arc<MemoryStore>,
     /// Per-room FIFO workers that serialize turns within each room.
     pub rooms: Arc<RoomQueues>,
+    /// Reusable skills (read/write/index), injected + editable.
+    pub skills: Arc<SkillStore>,
 }
 
 impl BotCtx {
@@ -392,12 +401,20 @@ async fn process_turn(ctx: &BotCtx, agentic_gate: &Arc<Semaphore>, turn: Turn) {
     } else {
         (String::new(), String::new())
     };
+    let skills_index = ctx
+        .skills
+        .index()
+        .into_iter()
+        .map(|(n, d)| if d.is_empty() { format!("- {}", n) } else { format!("- {}: {}", n, d) })
+        .collect::<Vec<_>>()
+        .join("\n");
     let system_prompt = assemble_system_prompt(
         &base_prompt,
         &operating_global,
         &operating_room,
         &memory_global,
         &memory_room,
+        &skills_index,
     );
 
     let agentic = llm.is_subprocess();
@@ -732,7 +749,8 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
              `/jobs` — list active background jobs\n\
              `/cancel <id>` — cancel a running background job\n\
              `/agents` — list configured subagents\n\
-             `/agent <name> <task>` — run a subagent on a task"
+             `/agent <name> <task>` — run a subagent on a task\n\
+             `/skills [approve|forget <name>|suggest]` — list/manage skills"
                 .to_string(),
         ),
         "/clear" => {
@@ -755,11 +773,13 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
                 client.model().to_string()
             };
             let (mcp_servers, mcp_tools) = ctx.tool_executor.mcp_summary();
+            let (skills_active, skills_pending) = ctx.skills.list();
             Some(format!(
-                "**Roger status**\nUptime: {}h {}m {}s\nProfile: {} ({})\nHistory: {} messages (this room)\nMemory: {}t global, {}t this room\nMCP: {} server(s), {} tool(s)\nRequests: {} ({} errors), avg {}ms\nActive jobs: {}",
+                "**Roger status**\nUptime: {}h {}m {}s\nProfile: {} ({})\nHistory: {} messages (this room)\nMemory: {}t global, {}t this room\nMCP: {} server(s), {} tool(s)\nSkills: {} active, {} pending\nRequests: {} ({} errors), avg {}ms\nActive jobs: {}",
                 h, m, s, profile, model_desc, history_len,
                 ctx.memory.global_tokens(), ctx.memory.room_tokens(room_id),
                 mcp_servers, mcp_tools,
+                skills_active.len(), skills_pending.len(),
                 m_snap.requests, m_snap.errors, m_snap.avg_latency_ms,
                 ctx.workers.count()
             ))
@@ -819,8 +839,102 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
             }
         }
         "/agent" => Some(handle_agent_command(parts.get(1).copied(), room_id, ctx).await),
+        "/skills" => Some(handle_skills_command(parts.get(1).copied(), room_id, ctx).await),
         "/model" => Some(handle_model_command(parts.get(1).copied(), room_id, ctx).await),
         _ => Some(format!("Unknown command `{}`. Try `/help`.", parts[0])),
+    }
+}
+
+/// `/skills [list|approve <name>|forget <name>|suggest]`.
+async fn handle_skills_command(arg: Option<&str>, room_id: &str, ctx: &BotCtx) -> String {
+    let arg = arg.map(str::trim).unwrap_or("");
+    let (sub, rest) = arg
+        .split_once(char::is_whitespace)
+        .map(|(s, r)| (s, r.trim()))
+        .unwrap_or((arg, ""));
+    match sub {
+        "" | "list" => {
+            let (active, pending) = ctx.skills.list();
+            let mut out = String::from("**Skills**\n");
+            out.push_str(&format!(
+                "Active: {}\n",
+                if active.is_empty() { "(none)".into() } else { active.join(", ") }
+            ));
+            if !pending.is_empty() {
+                out.push_str(&format!("Pending: {}\n", pending.join(", ")));
+            }
+            out.push_str("`/skills approve <name>` · `/skills forget <name>` · `/skills suggest`");
+            out
+        }
+        "approve" => match ctx.skills.approve(rest) {
+            Ok(_) => format!("Approved skill `{}`.", rest),
+            Err(e) => format!("error: {}", e),
+        },
+        "forget" => match ctx.skills.forget(rest) {
+            Ok(true) => format!("Forgot skill `{}`.", rest),
+            Ok(false) => format!("No learned/pending skill `{}`.", rest),
+            Err(e) => format!("error: {}", e),
+        },
+        "suggest" => handle_skills_suggest(room_id, ctx).await,
+        _ => "Usage: `/skills [approve|forget <name>|suggest]`".to_string(),
+    }
+}
+
+/// `/skills suggest` — ask the compaction-profile LLM to propose one reusable skill
+/// from recent history; save it to pending for review.
+async fn handle_skills_suggest(room_id: &str, ctx: &BotCtx) -> String {
+    let (llm, existing) = {
+        let st = ctx.state.read().await;
+        (st.llms.get(&st.compaction.profile).cloned(), ctx.skills.list().0)
+    };
+    let Some(llm) = llm else {
+        return "error: compaction profile unavailable for suggestions".to_string();
+    };
+    let history = ctx.history.windowed_by_tokens(room_id, 4000);
+    if history.len() < 3 {
+        return "Not enough history yet to suggest a skill.".to_string();
+    }
+    let transcript = history
+        .iter()
+        .map(|m| format!("{}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let sys = format!(
+        "From this conversation, propose ONE reusable skill (a procedure worth saving \
+         for recurring tasks). Output EXACTLY:\n### NAME\n<kebab-case>\n### DESCRIPTION\n\
+         <one line>\n### STEPS\n<markdown steps>\nIf nothing is worth saving, output only \
+         NONE. Do not duplicate existing skills: {}",
+        if existing.is_empty() { "(none)".into() } else { existing.join(", ") }
+    );
+    let out = match llm.chat(&[ChatMessage::system(&sys), ChatMessage::user(&transcript)]).await {
+        Ok(t) => t,
+        Err(e) => return format!("error: suggestion failed: {}", e),
+    };
+    if out.trim().eq_ignore_ascii_case("none") || !out.contains("### NAME") {
+        return "No skill worth suggesting right now.".to_string();
+    }
+    let name = extract_section(&out, "### NAME");
+    let desc = extract_section(&out, "### DESCRIPTION");
+    let steps = extract_section(&out, "### STEPS");
+    if name.is_empty() || steps.is_empty() {
+        return "Suggestion was malformed; skipped.".to_string();
+    }
+    let content = format!("# {}\n\n{}\n\n{}", name, desc, steps);
+    match ctx.skills.write_pending(&name, &content) {
+        Ok(_) => format!("Suggested skill `{}` — review with `/skills`, then `/skills approve {}`.", name, name),
+        Err(e) => format!("error: {}", e),
+    }
+}
+
+/// Extract the text under a `### HEADER` up to the next `### ` header (or end).
+fn extract_section(text: &str, header: &str) -> String {
+    match text.find(header) {
+        None => String::new(),
+        Some(i) => {
+            let rest = &text[i + header.len()..];
+            let end = rest.find("\n### ").unwrap_or(rest.len());
+            rest[..end].trim().to_string()
+        }
     }
 }
 
@@ -1035,11 +1149,12 @@ mod tests {
             state: Arc::new(RwLock::new(state())),
             room_profiles: Arc::new(RoomProfileStore::new(dir.path().join("rp.json"))),
             metrics: Arc::new(Metrics::default()),
-            tool_executor: Arc::new(ToolExecutor::with_projects(None, HashMap::new(), None, None)),
+            tool_executor: Arc::new(ToolExecutor::with_projects(None, HashMap::new(), None, None, None)),
             workers: Arc::new(Workers::new(4)),
             room_workdirs: Arc::new(RoomWorkdirStore::load(dir.path().join("rw.json"))),
             memory: Arc::new(MemoryStore::new(dir.path(), None)),
             rooms: Arc::new(RoomQueues::default()),
+            skills: Arc::new(SkillStore::new(dir.path(), dir.path())),
         }
     }
 

@@ -125,6 +125,34 @@ pub fn tool_definitions() -> Value {
         {
             "type": "function",
             "function": {
+                "name": "read_skill",
+                "description": "Load the full steps of a named skill listed in the Skills section.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "name": { "type": "string", "description": "The skill name" } },
+                    "required": ["name"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_skill",
+                "description": "Capture a reusable procedure as a skill (saved pending user approval). Use after solving a non-trivial task that would recur.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Short kebab-case skill name" },
+                        "description": { "type": "string", "description": "One-line summary of what it does / when to use it" },
+                        "steps": { "type": "string", "description": "The procedure, as markdown steps" }
+                    },
+                    "required": ["name", "description", "steps"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "set_workdir",
                 "description": "Set the working directory (project) for this room's agentic coding agent. Call this when the user asks to work on, edit, or build a specific known project. The choice persists for the room until changed.",
                 "parameters": {
@@ -169,6 +197,8 @@ pub struct ToolExecutor {
     room_workdirs: Option<Arc<RoomWorkdirStore>>,
     /// Connected MCP servers whose tools are also exposed to the model.
     mcp: Option<Arc<McpManager>>,
+    /// Skill store for read_skill / write_skill.
+    skills: Option<Arc<crate::skills::SkillStore>>,
 }
 
 impl ToolExecutor {
@@ -177,6 +207,7 @@ impl ToolExecutor {
         projects: HashMap<String, String>,
         room_workdirs: Option<Arc<RoomWorkdirStore>>,
         mcp: Option<Arc<McpManager>>,
+        skills: Option<Arc<crate::skills::SkillStore>>,
     ) -> Self {
         ToolExecutor {
             http: Client::builder()
@@ -188,6 +219,7 @@ impl ToolExecutor {
             projects,
             room_workdirs,
             mcp,
+            skills,
         }
     }
 
@@ -273,6 +305,31 @@ impl ToolExecutor {
             "set_workdir" => {
                 let project = args["project"].as_str().unwrap_or("").to_string();
                 self.set_workdir(&project)
+            }
+            "read_skill" => {
+                let name = args["name"].as_str().unwrap_or("");
+                match &self.skills {
+                    Some(s) => s.read(name).unwrap_or_else(|| format!("error: no skill named '{}'", name)),
+                    None => "error: skills are not configured".to_string(),
+                }
+            }
+            "write_skill" => {
+                let name = args["name"].as_str().unwrap_or("");
+                let desc = args["description"].as_str().unwrap_or("");
+                let steps = args["steps"].as_str().unwrap_or("");
+                match &self.skills {
+                    None => "error: skills are not configured".to_string(),
+                    Some(s) => {
+                        let content = format!("# {}\n\n{}\n\n{}", name, desc, steps);
+                        match s.write_pending(name, &content) {
+                            Ok(_) => format!(
+                                "Drafted skill '{}' (pending). Ask the user to run `/skills approve {}`.",
+                                name, name
+                            ),
+                            Err(e) => format!("error: {}", e),
+                        }
+                    }
+                }
             }
             "run_subagent" => {
                 let agent = args["agent"].as_str().unwrap_or("").to_string();
@@ -632,7 +689,7 @@ mod tests {
         let store = Arc::new(RoomWorkdirStore::load(dir.path().join("rw.json")));
         let mut projects = HashMap::new();
         projects.insert("foo".to_string(), "/tmp/foo".to_string());
-        let exec = ToolExecutor::with_projects(None, projects, Some(store.clone()), None);
+        let exec = ToolExecutor::with_projects(None, projects, Some(store.clone()), None, None);
 
         let out = ROOM_ID
             .scope("!room:s".to_string(), exec.execute(&workdir_call("foo")))
@@ -645,7 +702,7 @@ mod tests {
     async fn set_workdir_unknown_project_errors() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(RoomWorkdirStore::load(dir.path().join("rw.json")));
-        let exec = ToolExecutor::with_projects(None, HashMap::new(), Some(store.clone()), None);
+        let exec = ToolExecutor::with_projects(None, HashMap::new(), Some(store.clone()), None, None);
 
         let out = ROOM_ID
             .scope("!room:s".to_string(), exec.execute(&workdir_call("bar")))
@@ -656,9 +713,9 @@ mod tests {
 
     #[test]
     fn executor_tool_definitions_returns_native_without_mcp() {
-        let exec = ToolExecutor::with_projects(None, HashMap::new(), None, None);
+        let exec = ToolExecutor::with_projects(None, HashMap::new(), None, None, None);
         let arr = exec.tool_definitions();
-        assert_eq!(arr.as_array().unwrap().len(), 6);
+        assert_eq!(arr.as_array().unwrap().len(), 8);
     }
 
     struct MockHost;
@@ -673,8 +730,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_subagent_advertised_only_when_scoped() {
-        let exec = ToolExecutor::with_projects(None, HashMap::new(), None, None);
-        assert_eq!(exec.tool_definitions().as_array().unwrap().len(), 6);
+        let exec = ToolExecutor::with_projects(None, HashMap::new(), None, None, None);
+        assert_eq!(exec.tool_definitions().as_array().unwrap().len(), 8);
 
         let host: Arc<dyn SubagentHost> = Arc::new(MockHost);
         let defs = SUBAGENT.scope(host, async { exec.tool_definitions() }).await;
@@ -689,7 +746,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_subagent_routes_to_host_or_errors() {
-        let exec = ToolExecutor::with_projects(None, HashMap::new(), None, None);
+        let exec = ToolExecutor::with_projects(None, HashMap::new(), None, None, None);
         let call = ToolCall {
             id: "1".into(),
             kind: "function".into(),
@@ -711,14 +768,17 @@ mod tests {
         let defs = tool_definitions();
         assert!(defs.is_array());
         let arr = defs.as_array().unwrap();
-        assert_eq!(arr.len(), 6);
+        assert_eq!(arr.len(), 8);
         let names: Vec<&str> = arr
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
         assert_eq!(
             names,
-            &["web_search", "web_fetch", "read_file", "write_file", "list_dir", "set_workdir"]
+            &[
+                "web_search", "web_fetch", "read_file", "write_file", "list_dir",
+                "read_skill", "write_skill", "set_workdir"
+            ]
         );
     }
 }

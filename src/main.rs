@@ -9,6 +9,7 @@ mod memory;
 mod metrics;
 mod room_profiles;
 mod room_workdirs;
+mod skills;
 mod subprocess;
 mod tools;
 mod workers;
@@ -179,12 +180,16 @@ async fn main() -> Result<()> {
         info!("mcp: {} server(s), {} tool(s)", servers, tools);
     }
 
-    // Build tool executor (web_search, web_fetch, set_workdir, MCP tools)
+    // Reusable skills store (committed config/skills + learned ~/.roger/skills).
+    let skills = Arc::new(skills::SkillStore::new(&config_dir, &state_dir));
+
+    // Build tool executor (web/file tools, set_workdir, MCP, skills)
     let tool_executor = Arc::new(tools::ToolExecutor::with_projects(
         cfg.searxng_url.clone(),
         projects,
         Some(room_workdirs.clone()),
         Some(mcp.clone()),
+        Some(skills.clone()),
     ));
     if let Some(url) = &cfg.searxng_url {
         info!("searxng: {} (web_search enabled)", url);
@@ -270,6 +275,7 @@ async fn main() -> Result<()> {
         room_workdirs,
         memory,
         rooms: Arc::new(matrix::handler::RoomQueues::default()),
+        skills,
     };
 
     client.add_event_handler_context(bot_ctx);

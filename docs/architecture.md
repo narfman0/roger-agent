@@ -162,6 +162,20 @@ calls `metrics.record(latency_ms, ok)` and emits a structured log line
 sink doubles as a metrics scrape source. Live totals are shown in `/status`.
 Counters reset on restart.
 
+## Skills
+
+Skills are reusable procedures as markdown files (`src/skills.rs`, `SkillStore`):
+active skills live in `config/skills/` (committed) and `~/.roger/skills/active/`
+(learned, overriding committed by name); drafts land in `~/.roger/skills/pending/`.
+The small **index** (name + one-line description) is injected into the system prompt
+(a `## Skills` section in `assemble_system_prompt`); full bodies load on demand via
+the `read_skill(name)` tool. Self-improvement is **approval-gated**: the model's
+`write_skill(name, description, steps)` tool and `/skills suggest` (which asks the
+compaction profile to distill one skill from recent history) both write to *pending*
+— a skill only goes active after `/skills approve <name>`. `/skills` lists active +
+pending; `/skills forget <name>` removes a learned/pending one (committed skills are
+read-only). This complements memory: memory holds facts, skills hold procedures.
+
 ## Subagents
 
 Named subagents (`[agents.<name>]` → profile + system prompt + description) let the
