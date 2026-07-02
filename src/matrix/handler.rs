@@ -246,9 +246,9 @@ pub async fn handle_invite(
         if let Err(e) = room.join().await {
             warn!("failed to join room {}: {}", room_id, e);
         } else {
-            // Advertise bot commands to clients that support m.room.bot.options
-            // (Fractal, some others — Element Web uses its own command registry).
-            publish_bot_options(&room).await;
+            // Advertise bot commands to clients that support m.room.bot.options.
+            let bot_id = client.user_id().map(|u| u.to_string()).unwrap_or_default();
+            publish_bot_options(&room, &bot_id).await;
         }
     } else {
         warn!("declining invite to non-allowlisted room {}", room_id);
@@ -256,28 +256,27 @@ pub async fn handle_invite(
 }
 
 /// Send an `m.room.bot.options` state event advertising Roger's slash commands.
-/// This is a best-effort hint; clients that don't support it ignore the event.
-pub async fn publish_bot_options(room: &Room) {
-    let commands = serde_json::json!({
-        "help":           {"description": "Show command reference"},
-        "status":         {"description": "Uptime, model, history stats, active jobs"},
-        "jobs":           {"description": "List background jobs"},
-        "model":          {"description": "Show or switch LLM profile for this room"},
-        "cancel":         {"description": "Abort a background job (/cancel <id>)"},
-        "clear":          {"description": "Wipe conversation history for this room"},
-        "forget":         {"description": "Wipe durable memory (/forget global for shared)"},
-        "agents":         {"description": "List configured subagents"},
-        "agent":          {"description": "Run a subagent (/agent <name> <task>)"},
-        "skills":         {"description": "List active + pending skills"},
-        "skills suggest": {"description": "Draft a skill from recent history"},
-        "skills approve": {"description": "Promote a pending skill (/skills approve <name>)"},
-        "skills forget":  {"description": "Remove a skill (/skills forget <name>)"}
-    });
+/// State key is the bot's Matrix user ID so multiple bots don't overwrite each other.
+/// Content uses the array format expected by clients (e.g. the Element X bot commands PR).
+pub async fn publish_bot_options(room: &Room, bot_user_id: &str) {
     let content = serde_json::json!({
-        "prefix": "/",
-        "commands": commands
+        "commands": [
+            {"command": "/help",           "description": "Show command reference"},
+            {"command": "/status",         "description": "Uptime, model, history stats, active jobs"},
+            {"command": "/jobs",           "description": "List background jobs"},
+            {"command": "/model",          "parameters": "<profile>",       "description": "Show or switch LLM profile for this room"},
+            {"command": "/cancel",         "parameters": "<id>",            "description": "Abort a background job"},
+            {"command": "/clear",          "description": "Wipe conversation history for this room"},
+            {"command": "/forget",         "parameters": "[global]",        "description": "Wipe durable memory"},
+            {"command": "/agents",         "description": "List configured subagents"},
+            {"command": "/agent",          "parameters": "<name> <task>",   "description": "Run a subagent"},
+            {"command": "/skills",         "description": "List active + pending skills"},
+            {"command": "/skills suggest", "description": "Draft a skill from recent history"},
+            {"command": "/skills approve", "parameters": "<name>",          "description": "Promote a pending skill"},
+            {"command": "/skills forget",  "parameters": "<name>",          "description": "Remove a skill"}
+        ]
     });
-    if let Err(e) = room.send_state_event_raw("m.room.bot.options", "", content).await {
+    if let Err(e) = room.send_state_event_raw("m.room.bot.options", bot_user_id, content).await {
         warn!("failed to publish m.room.bot.options: {}", e);
     }
 }

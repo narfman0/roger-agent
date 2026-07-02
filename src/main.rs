@@ -264,7 +264,7 @@ async fn main() -> Result<()> {
     let web_cfg = cfg.web.clone();
     let bot_ctx = BotCtx {
         allowed_rooms: HashSet::from_iter(cfg.room_allowlist.iter().cloned()),
-        bot_user_id,
+        bot_user_id: bot_user_id.clone(),
         bot_localpart,
         speaches,
         history,
@@ -297,11 +297,12 @@ async fn main() -> Result<()> {
     // support it show command hints without needing a fresh invite.
     {
         let c = client.clone();
+        let startup_bot_id = bot_user_id.clone();
         tokio::spawn(async move {
             // Brief delay to let the initial sync complete before sending state events.
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             for room in c.joined_rooms() {
-                matrix::handler::publish_bot_options(&room).await;
+                matrix::handler::publish_bot_options(&room, &startup_bot_id).await;
             }
         });
     }
