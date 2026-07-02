@@ -105,6 +105,7 @@ async fn reload_on_sighup(config_dir: PathBuf, state: Arc<RwLock<ReloadableState
         st.memory_max_global_tokens = cfg.memory.max_global_tokens;
         st.memory_max_room_tokens = cfg.memory.max_room_tokens;
         st.compaction = cfg.compaction;
+        st.agents = cfg.agents;
         // Drop runtime /model overrides that point at a profile that no longer builds.
         let valid: HashSet<String> = st.llms.keys().cloned().collect();
         st.room_profiles.retain(|_, profile| valid.contains(profile));
@@ -248,6 +249,7 @@ async fn main() -> Result<()> {
         memory_max_global_tokens: cfg.memory.max_global_tokens,
         memory_max_room_tokens: cfg.memory.max_room_tokens,
         compaction: cfg.compaction,
+        agents: cfg.agents,
     }));
 
     // Spawn the SIGHUP hot-reload listener

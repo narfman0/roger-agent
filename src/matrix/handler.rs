@@ -1,6 +1,6 @@
 use crate::{
     audio::SpeachesClient,
-    config::{CommsConfig, CommsMode, CompactionConfig, RoomConfig},
+    config::{AgentConfig, CommsConfig, CommsMode, CompactionConfig, RoomConfig},
     history::{ChatMessage, HistoryStore},
     llm::ProfileLlm,
     memory::MemoryStore,
@@ -8,7 +8,7 @@ use crate::{
     room_profiles::RoomProfileStore,
     room_workdirs::RoomWorkdirStore,
     subprocess::WORKDIR,
-    tools::{ToolExecutor, ROOM_ID},
+    tools::{SubagentHost, ToolExecutor, ROOM_ID, SUBAGENT},
     workers::{JobHandle, Workers},
 };
 use matrix_sdk::{
@@ -145,6 +145,8 @@ pub struct ReloadableState {
     pub memory_max_room_tokens: usize,
     /// Size-triggered history compaction settings.
     pub compaction: CompactionConfig,
+    /// Named subagents (for run_subagent / /agent).
+    pub agents: HashMap<String, AgentConfig>,
 }
 
 impl ReloadableState {
@@ -486,6 +488,9 @@ async fn run_response_job(
     let _ = room.typing_notice(true).await;
     let req_start = Instant::now();
 
+    // Snapshot subagent config so the producer can expose run_subagent.
+    let agents = bot.state.read().await.agents.clone();
+
     let (tx, mut rx) = mpsc::channel::<String>(64);
     let stream_handle = {
         let llm = llm.clone();
@@ -493,18 +498,24 @@ async fn run_response_job(
         let executor = bot.tool_executor.clone();
         let room_scope = room_id.clone();
         let wd = workdir.clone();
+        let bot2 = bot.clone();
         // Task-locals don't cross spawn boundaries, so scope them inside the
-        // producer task: ROOM_ID lets set_workdir target this room; WORKDIR gives
-        // a subprocess backend the room's resolved working directory.
+        // producer task: ROOM_ID lets set_workdir target this room; WORKDIR gives a
+        // subprocess backend the room's workdir; SUBAGENT enables run_subagent.
         tokio::spawn(async move {
-            ROOM_ID
-                .scope(
-                    room_scope,
-                    WORKDIR.scope(wd, async move {
-                        llm.chat_with_tools(&messages, Some(&executor), tx).await
-                    }),
-                )
-                .await
+            let inner = ROOM_ID.scope(
+                room_scope,
+                WORKDIR.scope(wd, async move {
+                    llm.chat_with_tools(&messages, Some(&executor), tx).await
+                }),
+            );
+            if agents.is_empty() {
+                inner.await
+            } else {
+                let host: Arc<dyn SubagentHost> =
+                    Arc::new(SubagentHostImpl { bot: bot2, agents, depth: 0 });
+                SUBAGENT.scope(host, inner).await
+            }
         })
     };
 
@@ -632,6 +643,75 @@ async fn maybe_compact(bot: &BotCtx, room_id: &str) {
     ));
 }
 
+/// Max nesting for subagents delegating to subagents.
+const MAX_SUBAGENT_DEPTH: usize = 2;
+
+/// Runs named subagents. Owns a `BotCtx` (for the LLM registry + tool executor) and
+/// a snapshot of the agent config; nested calls increment `depth`.
+struct SubagentHostImpl {
+    bot: BotCtx,
+    agents: HashMap<String, AgentConfig>,
+    depth: usize,
+}
+
+impl SubagentHost for SubagentHostImpl {
+    fn agents(&self) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = self
+            .agents
+            .iter()
+            .map(|(n, a)| (n.clone(), a.description.clone()))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    fn run<'a>(&'a self, name: &'a str, task: &'a str) -> futures_util::future::BoxFuture<'a, String> {
+        Box::pin(self.run_impl(name, task))
+    }
+}
+
+impl SubagentHostImpl {
+    async fn run_impl(&self, name: &str, task: &str) -> String {
+        if self.depth >= MAX_SUBAGENT_DEPTH {
+            return "error: subagent nesting limit reached".to_string();
+        }
+        let Some(agent) = self.agents.get(name) else {
+            let avail = self.agents.keys().cloned().collect::<Vec<_>>().join(", ");
+            return format!("error: unknown subagent '{}'. Available: {}", name, avail);
+        };
+        let llm = self.bot.state.read().await.llms.get(&agent.profile).cloned();
+        let Some(llm) = llm else {
+            return format!("error: subagent '{}' profile '{}' is unavailable", name, agent.profile);
+        };
+        let sys = agent
+            .system_prompt
+            .clone()
+            .unwrap_or_else(|| format!("You are the '{}' subagent. Complete the task and report the result.", name));
+        let messages = vec![ChatMessage::system(&sys), ChatMessage::user(task)];
+        let executor = self.bot.tool_executor.clone();
+        // Headless: drain the stream channel; we only want the returned text.
+        let (tx, mut rx) = mpsc::channel::<String>(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        // Deeper host so a subagent can itself delegate (bounded by depth).
+        let deeper: Arc<dyn SubagentHost> = Arc::new(SubagentHostImpl {
+            bot: self.bot.clone(),
+            agents: self.agents.clone(),
+            depth: self.depth + 1,
+        });
+        info!(agent = %name, profile = %agent.profile, depth = self.depth, "running subagent");
+        let result = SUBAGENT
+            .scope(deeper, async move {
+                llm.chat_with_tools(&messages, Some(executor.as_ref()), tx).await
+            })
+            .await;
+        drain.abort();
+        match result {
+            Ok(text) => text,
+            Err(e) => format!("subagent error: {}", e),
+        }
+    }
+}
+
 /// Returns Some(reply) if the message is a slash command, None otherwise.
 async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option<String> {
     let trimmed = body.trim();
@@ -650,7 +730,9 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
              `/status` — show uptime, model, and history stats\n\
              `/model [name]` — show/switch this room's LLM profile (`/model reset` to revert)\n\
              `/jobs` — list active background jobs\n\
-             `/cancel <id>` — cancel a running background job"
+             `/cancel <id>` — cancel a running background job\n\
+             `/agents` — list configured subagents\n\
+             `/agent <name> <task>` — run a subagent on a task"
                 .to_string(),
         ),
         "/clear" => {
@@ -720,9 +802,58 @@ async fn handle_slash_command(body: &str, room_id: &str, ctx: &BotCtx) -> Option
                 Err(e) => Some(format!("Failed to clear memory: {}", e)),
             }
         }
+        "/agents" => {
+            let agents = ctx.state.read().await.agents.clone();
+            if agents.is_empty() {
+                Some("No subagents configured. Add `[agents.<name>]` in profiles.toml.".to_string())
+            } else {
+                let mut names: Vec<_> = agents.iter().collect();
+                names.sort_by(|a, b| a.0.cmp(b.0));
+                let mut out = String::from("**Subagents**\n");
+                for (n, a) in names {
+                    let desc = if a.description.is_empty() { "—" } else { &a.description };
+                    out.push_str(&format!("`{}` ({}) — {}\n", n, a.profile, desc));
+                }
+                out.push_str("`/agent <name> <task>` to run one.");
+                Some(out)
+            }
+        }
+        "/agent" => Some(handle_agent_command(parts.get(1).copied(), room_id, ctx).await),
         "/model" => Some(handle_model_command(parts.get(1).copied(), room_id, ctx).await),
         _ => Some(format!("Unknown command `{}`. Try `/help`.", parts[0])),
     }
+}
+
+/// `/agent <name> <task>` — run a named subagent on a task in this room's context.
+async fn handle_agent_command(arg: Option<&str>, room_id: &str, ctx: &BotCtx) -> String {
+    let rest = arg.map(str::trim).unwrap_or("");
+    let (name, task) = rest
+        .split_once(char::is_whitespace)
+        .map(|(n, t)| (n, t.trim()))
+        .unwrap_or((rest, ""));
+    if name.is_empty() || task.is_empty() {
+        return "Usage: `/agent <name> <task>` (see `/agents`).".to_string();
+    }
+    let (agents, default_wd) = {
+        let st = ctx.state.read().await;
+        (st.agents.clone(), st.comms.default_workdir.clone())
+    };
+    if !agents.contains_key(name) {
+        return format!("Unknown subagent `{}`. See `/agents`.", name);
+    }
+    let workdir: Option<PathBuf> = ctx
+        .room_workdirs
+        .get(room_id)
+        .map(PathBuf::from)
+        .or_else(|| default_wd.as_deref().map(crate::config::expand_tilde));
+    let host = SubagentHostImpl { bot: ctx.clone(), agents, depth: 0 };
+    // Scope the room context so a subprocess subagent gets its workdir.
+    ROOM_ID
+        .scope(
+            room_id.to_string(),
+            WORKDIR.scope(workdir, host.run_impl(name, task)),
+        )
+        .await
 }
 
 /// `/model` — show or switch the LLM profile for this room. Persists overrides.
@@ -853,6 +984,7 @@ mod tests {
             memory_max_global_tokens: 1500,
             memory_max_room_tokens: 3000,
             compaction: CompactionConfig::default(),
+            agents: HashMap::new(),
         }
     }
 

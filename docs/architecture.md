@@ -162,6 +162,21 @@ calls `metrics.record(latency_ms, ok)` and emits a structured log line
 sink doubles as a metrics scrape source. Live totals are shown in `/status`.
 Counters reset on restart.
 
+## Subagents
+
+Named subagents (`[agents.<name>]` → profile + system prompt + description) let the
+model delegate a scoped task and get the result back. The `run_subagent(agent, task)`
+tool is advertised (dynamically, with the agent list) only while a `SubagentHost` is
+in scope; `handle_message`'s producer scopes one when agents are configured. The host
+(`SubagentHostImpl`, which owns the LLM registry via `BotCtx`) resolves the agent's
+profile, runs it **headless** (`chat_with_tools` with the stream drained — only the
+returned text is used), and returns it as the tool result. `tools.rs` stays decoupled
+via the `SubagentHost` trait + `SUBAGENT` task-local (same pattern as `set_workdir`'s
+`ROOM_ID`). Subagents inherit the room's `ROOM_ID`/`WORKDIR`, so a `code`-profile
+subagent runs claude-code in the room's worktree. Nesting is capped
+(`MAX_SUBAGENT_DEPTH`); each level scopes a deeper host. `/agents` lists them and
+`/agent <name> <task>` runs one manually.
+
 ## Tools & MCP
 
 HTTP backends run a tool loop; the advertised tool list is dynamic, owned by

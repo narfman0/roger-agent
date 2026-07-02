@@ -1,5 +1,6 @@
 use crate::mcp::McpManager;
 use crate::room_workdirs::RoomWorkdirStore;
+use futures_util::future::BoxFuture;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -11,6 +12,20 @@ tokio::task_local! {
     /// The room id of the in-flight request, set by the orchestrator around the
     /// producer task so the `set_workdir` tool knows which room to record against.
     pub static ROOM_ID: String;
+
+    /// Handle for delegating to named subagents (`run_subagent`), set by the
+    /// orchestrator when subagents are configured. Implemented in the handler,
+    /// which has the LLM registry; kept as a trait so `tools` stays decoupled.
+    pub static SUBAGENT: Arc<dyn SubagentHost>;
+}
+
+/// Runs named subagents on behalf of the `run_subagent` tool. The handler provides
+/// the implementation (it owns the LLM registry + agent config).
+pub trait SubagentHost: Send + Sync {
+    /// (name, description) of available subagents, for the tool schema.
+    fn agents(&self) -> Vec<(String, String)>;
+    /// Run a named subagent on a task, returning its text result.
+    fn run<'a>(&'a self, name: &'a str, task: &'a str) -> BoxFuture<'a, String>;
 }
 
 // ── Tool definitions sent to the LLM ────────────────────────────────────────
@@ -181,8 +196,9 @@ impl ToolExecutor {
         self.mcp.as_ref().map_or((0, 0), |m| m.summary())
     }
 
-    /// The full tool list advertised to the model: roger's native tools plus any
-    /// connected MCP server tools.
+    /// The full tool list advertised to the model: roger's native tools, connected
+    /// MCP server tools, and — when subagents are configured for this turn —
+    /// `run_subagent`.
     pub fn tool_definitions(&self) -> Value {
         let mut defs = match tool_definitions() {
             Value::Array(a) => a,
@@ -190,6 +206,30 @@ impl ToolExecutor {
         };
         if let Some(mcp) = &self.mcp {
             defs.extend(mcp.tool_definitions());
+        }
+        if let Ok(agents) = SUBAGENT.try_with(|h| h.agents()) {
+            if !agents.is_empty() {
+                let listed = agents
+                    .iter()
+                    .map(|(n, d)| if d.is_empty() { n.clone() } else { format!("{} — {}", n, d) })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                defs.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": "run_subagent",
+                        "description": format!("Delegate a self-contained task to a named subagent and get its result back. Available agents: {}", listed),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "agent": { "type": "string", "description": "The subagent name" },
+                                "task": { "type": "string", "description": "The task, with all context the subagent needs" }
+                            },
+                            "required": ["agent", "task"]
+                        }
+                    }
+                }));
+            }
         }
         Value::Array(defs)
     }
@@ -233,6 +273,14 @@ impl ToolExecutor {
             "set_workdir" => {
                 let project = args["project"].as_str().unwrap_or("").to_string();
                 self.set_workdir(&project)
+            }
+            "run_subagent" => {
+                let agent = args["agent"].as_str().unwrap_or("").to_string();
+                let task = args["task"].as_str().unwrap_or("").to_string();
+                match SUBAGENT.try_with(|h| h.clone()) {
+                    Ok(host) => host.run(&agent, &task).await,
+                    Err(_) => "error: subagents are not available".to_string(),
+                }
             }
             other => format!("error: unknown tool '{}'", other),
         }
@@ -611,6 +659,51 @@ mod tests {
         let exec = ToolExecutor::with_projects(None, HashMap::new(), None, None);
         let arr = exec.tool_definitions();
         assert_eq!(arr.as_array().unwrap().len(), 6);
+    }
+
+    struct MockHost;
+    impl SubagentHost for MockHost {
+        fn agents(&self) -> Vec<(String, String)> {
+            vec![("coder".into(), "writes code".into())]
+        }
+        fn run<'a>(&'a self, _name: &'a str, _task: &'a str) -> BoxFuture<'a, String> {
+            Box::pin(async { "subagent output".to_string() })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_subagent_advertised_only_when_scoped() {
+        let exec = ToolExecutor::with_projects(None, HashMap::new(), None, None);
+        assert_eq!(exec.tool_definitions().as_array().unwrap().len(), 6);
+
+        let host: Arc<dyn SubagentHost> = Arc::new(MockHost);
+        let defs = SUBAGENT.scope(host, async { exec.tool_definitions() }).await;
+        let names: Vec<String> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"run_subagent".to_string()));
+    }
+
+    #[tokio::test]
+    async fn run_subagent_routes_to_host_or_errors() {
+        let exec = ToolExecutor::with_projects(None, HashMap::new(), None, None);
+        let call = ToolCall {
+            id: "1".into(),
+            kind: "function".into(),
+            function: ToolFunction {
+                name: "run_subagent".into(),
+                arguments: r#"{"agent":"coder","task":"hi"}"#.into(),
+            },
+        };
+        // Unscoped → not available.
+        assert!(exec.execute(&call).await.contains("not available"));
+        // Scoped → routed to the host.
+        let host: Arc<dyn SubagentHost> = Arc::new(MockHost);
+        let out = SUBAGENT.scope(host, exec.execute(&call)).await;
+        assert_eq!(out, "subagent output");
     }
 
     #[test]

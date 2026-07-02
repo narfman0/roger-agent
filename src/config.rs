@@ -277,6 +277,20 @@ pub struct McpConfig {
     pub servers: HashMap<String, McpServerConfig>,
 }
 
+/// A named subagent the model can delegate to via `run_subagent`, or you can
+/// invoke with `/agent <name> <task>`. Runs headless on the given profile.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentConfig {
+    /// LLM profile the subagent runs on (e.g. "fast", "reason", "code").
+    pub profile: String,
+    /// The subagent's system prompt (supports `{date}`). Falls back to a generic one.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// One-line description shown to the model in the `run_subagent` tool schema.
+    #[serde(default)]
+    pub description: String,
+}
+
 /// Git-worktree isolation for agentic subprocess jobs.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorktreeConfig {
@@ -311,6 +325,8 @@ struct ProfilesFile {
     #[serde(default)]
     worktrees: Option<WorktreeConfig>,
     #[serde(default)]
+    agents: HashMap<String, AgentConfig>,
+    #[serde(default)]
     context: Option<ContextConfig>,
     #[serde(default)]
     memory: Option<MemoryConfig>,
@@ -338,6 +354,7 @@ pub struct Config {
     pub compaction: CompactionConfig,
     pub mcp: McpConfig,
     pub worktrees: WorktreeConfig,
+    pub agents: HashMap<String, AgentConfig>,
     pub rooms: HashMap<String, RoomConfig>,
     /// Known projects (name → path) selectable via the `set_workdir` tool.
     pub projects: HashMap<String, String>,
@@ -400,6 +417,12 @@ impl Config {
             room.system_prompt = room.system_prompt.as_deref().map(inject_date);
         }
 
+        // Inject {date} into subagent system prompts.
+        let mut agents = profiles_file.agents;
+        for agent in agents.values_mut() {
+            agent.system_prompt = agent.system_prompt.as_deref().map(inject_date);
+        }
+
         Ok(Config {
             profiles: profiles_file.profiles,
             backends: backends_file.backends,
@@ -409,6 +432,7 @@ impl Config {
             compaction: profiles_file.compaction.unwrap_or_default(),
             mcp: profiles_file.mcp.unwrap_or_default(),
             worktrees: profiles_file.worktrees.unwrap_or_default(),
+            agents,
             rooms,
             projects: profiles_file.projects,
             matrix_homeserver,
