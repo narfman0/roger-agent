@@ -291,6 +291,28 @@ pub struct AgentConfig {
     pub description: String,
 }
 
+/// Thin HTTP control panel (axum). Disabled by default; enable in profiles.toml.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind address (e.g. "127.0.0.1:8765"). Default: 127.0.0.1:8765.
+    #[serde(default = "default_web_bind")]
+    pub bind: String,
+    /// Bearer token required in `Authorization: Bearer <token>` header.
+    /// Empty string disables auth (safe when bound to loopback only).
+    #[serde(default)]
+    pub auth_token: String,
+}
+
+fn default_web_bind() -> String { "127.0.0.1:8765".to_string() }
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        WebConfig { enabled: false, bind: default_web_bind(), auth_token: String::new() }
+    }
+}
+
 /// Git-worktree isolation for agentic subprocess jobs.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorktreeConfig {
@@ -325,6 +347,8 @@ struct ProfilesFile {
     #[serde(default)]
     worktrees: Option<WorktreeConfig>,
     #[serde(default)]
+    web: Option<WebConfig>,
+    #[serde(default)]
     agents: HashMap<String, AgentConfig>,
     #[serde(default)]
     context: Option<ContextConfig>,
@@ -354,6 +378,7 @@ pub struct Config {
     pub compaction: CompactionConfig,
     pub mcp: McpConfig,
     pub worktrees: WorktreeConfig,
+    pub web: WebConfig,
     pub agents: HashMap<String, AgentConfig>,
     pub rooms: HashMap<String, RoomConfig>,
     /// Known projects (name → path) selectable via the `set_workdir` tool.
@@ -432,6 +457,7 @@ impl Config {
             compaction: profiles_file.compaction.unwrap_or_default(),
             mcp: profiles_file.mcp.unwrap_or_default(),
             worktrees: profiles_file.worktrees.unwrap_or_default(),
+            web: profiles_file.web.unwrap_or_default(),
             agents,
             rooms,
             projects: profiles_file.projects,

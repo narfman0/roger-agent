@@ -20,6 +20,8 @@ futures-util = "0.3"
 chrono = "0.4"
 libc = "0.2"
 rmcp = { version = "2", features = ["client", "transport-child-process"] }
+axum = "0.7"
+tower = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

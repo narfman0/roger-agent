@@ -12,6 +12,7 @@ mod room_workdirs;
 mod skills;
 mod subprocess;
 mod tools;
+mod web;
 mod workers;
 
 use anyhow::Result;
@@ -260,6 +261,7 @@ async fn main() -> Result<()> {
     // Spawn the SIGHUP hot-reload listener
     tokio::spawn(reload_on_sighup(config_dir, state.clone()));
 
+    let web_cfg = cfg.web.clone();
     let bot_ctx = BotCtx {
         allowed_rooms: HashSet::from_iter(cfg.room_allowlist.iter().cloned()),
         bot_user_id,
@@ -277,6 +279,15 @@ async fn main() -> Result<()> {
         rooms: Arc::new(matrix::handler::RoomQueues::default()),
         skills,
     };
+
+    // Spawn the optional web control panel (after bot_ctx is built so we can clone it)
+    if web_cfg.enabled {
+        let web_bot = bot_ctx.clone();
+        let web_client = client.clone();
+        tokio::spawn(async move {
+            web::start(web_bot, web_client, web_cfg.bind, web_cfg.auth_token).await;
+        });
+    }
 
     client.add_event_handler_context(bot_ctx);
     client.add_event_handler(matrix::handler::handle_invite);

@@ -126,6 +126,14 @@ default_workdir = "~/.openclaw/workspace/roger-agent"
 roger = "~/.openclaw/workspace/roger-agent"
 # dotfiles = "~/dotfiles"
 
+# Thin web control panel. Disabled by default; set enabled = true to activate.
+# Bind to loopback and SSH-tunnel for remote access. Set auth_token for any
+# exposure beyond localhost.
+[web]
+enabled = false
+bind = "127.0.0.1:8765"
+# auth_token = "change-me"
+
 # Per-room overrides. require_mention defaults to true globally.
 # Set require_mention = false for rooms where the bot should respond to every message.
 # Optional `system_prompt` overrides the global prompt for that room (supports {date}).
