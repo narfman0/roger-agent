@@ -4,6 +4,7 @@ use crate::{
     config::{AgentConfig, CommsConfig, CommsMode, CompactionConfig, RoomConfig},
     history::{ChatMessage, HistoryStore},
     llm::ProfileLlm,
+    markdown,
     memory::MemoryStore,
     metrics::Metrics,
     room_profiles::RoomProfileStore,
@@ -122,9 +123,13 @@ fn assemble_system_prompt(
 }
 
 /// Edit a previously sent message in place via an `m.replace` relation.
-async fn edit_message(room: &Room, id: OwnedEventId, text: &str) {
-    let edited = RoomMessageEventContent::text_plain(text)
-        .make_replacement(ReplacementMetadata::new(id, None), None);
+/// If `html` is provided the edit uses `text_html`; otherwise plain text.
+async fn edit_message(room: &Room, id: OwnedEventId, text: &str, html: Option<&str>) {
+    let content = match html {
+        Some(h) => RoomMessageEventContent::text_html(text, h),
+        None => RoomMessageEventContent::text_plain(text),
+    };
+    let edited = content.make_replacement(ReplacementMetadata::new(id, None), None);
     if let Err(e) = room.send(edited).await {
         warn!("failed to edit message: {}", e);
     }
@@ -594,21 +599,36 @@ async fn run_response_job(
     let mut msg_id: Option<OwnedEventId> = None;
     let mut shown = String::new();
     let mut last_flush: Option<Instant> = None;
+    // HTML committed for all completed paragraphs; grows as \n\n boundaries land.
+    let mut committed_html = String::new();
+    let mut committed_up_to: usize = 0;
     while let Some(acc) = rx.recv().await {
         let elapsed = last_flush.unwrap_or(req_start).elapsed();
         let sentence_ready = last_sentence_end(&acc).map_or(false, |i| i >= shown.len());
         if !should_flush(acc != shown, elapsed, sentence_ready, flush.min_gap, flush.max_wait) {
             continue;
         }
+        // Advance committed_html to the latest safe paragraph boundary.
+        if let Some(end) = markdown::last_safe_paragraph_end(&acc) {
+            if end > committed_up_to {
+                committed_html = markdown::to_html(&acc[..end]);
+                committed_up_to = end;
+            }
+        }
+        let tail = &acc[committed_up_to..];
+        let formatted = markdown::streaming_formatted_body(&committed_html, tail);
         match &msg_id {
-            None => match room.send(RoomMessageEventContent::text_plain(&acc)).await {
-                Ok(resp) => msg_id = Some(resp.event_id),
-                Err(e) => {
-                    warn!("failed to send first response message: {}", e);
-                    continue;
+            None => {
+                let content = RoomMessageEventContent::text_html(&acc, &formatted);
+                match room.send(content).await {
+                    Ok(resp) => msg_id = Some(resp.event_id),
+                    Err(e) => {
+                        warn!("failed to send first response message: {}", e);
+                        continue;
+                    }
                 }
-            },
-            Some(id) => edit_message(&room, id.clone(), &acc).await,
+            }
+            Some(id) => edit_message(&room, id.clone(), &acc, Some(&formatted)).await,
         }
         shown = acc;
         last_flush = Some(Instant::now());
@@ -652,9 +672,10 @@ async fn run_response_job(
 
     match msg_id {
         Some(id) => {
-            if final_text != shown {
-                edit_message(&room, id, &final_text).await;
-            }
+            // Always do a final edit with full HTML render, even if plain text
+            // didn't change, because committed_html may still be partial.
+            let html = markdown::to_html(&final_text);
+            edit_message(&room, id, &final_text, Some(&html)).await;
         }
         None => {
             let text = if final_text.trim().is_empty() {
@@ -662,7 +683,10 @@ async fn run_response_job(
             } else {
                 final_text
             };
-            if let Err(e) = room.send(RoomMessageEventContent::text_plain(&text)).await {
+            let html = markdown::to_html(&text);
+            if let Err(e) =
+                room.send(RoomMessageEventContent::text_html(&text, &html)).await
+            {
                 warn!("failed to send response: {}", e);
             }
         }

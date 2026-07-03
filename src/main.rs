@@ -3,6 +3,7 @@ mod compaction;
 mod config;
 mod history;
 mod llm;
+mod markdown;
 mod matrix;
 mod mcp;
 mod memory;

@@ -22,6 +22,7 @@ libc = "0.2"
 rmcp = { version = "2", features = ["client", "transport-child-process"] }
 axum = "0.7"
 tower = "0.4"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 
 [dev-dependencies]
 tempfile = "3"
