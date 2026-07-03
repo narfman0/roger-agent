@@ -323,6 +323,18 @@ impl SubprocessBackend {
                                 }
                             }
                         }
+                        StreamEvent::BlockBreak => {
+                            // Separate consecutive text blocks (text → tool → text)
+                            // with a blank line, but only between real content and
+                            // never doubling up an existing trailing break.
+                            if !full.is_empty() && !full.ends_with("\n\n") {
+                                if full.ends_with('\n') {
+                                    full.push('\n');
+                                } else {
+                                    full.push_str("\n\n");
+                                }
+                            }
+                        }
                         StreamEvent::Final { text, is_error } => {
                             if is_error {
                                 run_error = Some(text.unwrap_or_else(|| full.clone()));
@@ -402,6 +414,10 @@ fn render_prompt(messages: &[ChatMessage]) -> (Option<String>, String) {
 enum StreamEvent {
     /// Incremental assistant text to append (claude: a delta; opencode: a full part).
     Text(String),
+    /// A new assistant content block began. Successive text blocks (e.g. text
+    /// before and after a tool call) must be separated by a blank line so they
+    /// don't glue together as one run-on paragraph.
+    BlockBreak,
     /// Terminal outcome. `text` = authoritative final (claude `result`); `None`
     /// means "use the accumulated text" (opencode, whose text lives in `Text`s).
     Final { text: Option<String>, is_error: bool },
@@ -425,15 +441,26 @@ fn parse_claude_line(line: &str) -> StreamEvent {
     match v.get("type").and_then(Value::as_str) {
         Some("stream_event") => {
             let ev = &v["event"];
-            if ev.get("type").and_then(Value::as_str) == Some("content_block_delta") {
-                let delta = &ev["delta"];
-                if delta.get("type").and_then(Value::as_str) == Some("text_delta") {
-                    if let Some(t) = delta.get("text").and_then(Value::as_str) {
-                        return StreamEvent::Text(t.to_string());
+            match ev.get("type").and_then(Value::as_str) {
+                Some("content_block_start") => {
+                    // A new text block after earlier output means a run-on unless we
+                    // insert a paragraph break (the loop only does so if text exists).
+                    if ev["content_block"].get("type").and_then(Value::as_str) == Some("text") {
+                        return StreamEvent::BlockBreak;
                     }
+                    StreamEvent::Other
                 }
+                Some("content_block_delta") => {
+                    let delta = &ev["delta"];
+                    if delta.get("type").and_then(Value::as_str) == Some("text_delta") {
+                        if let Some(t) = delta.get("text").and_then(Value::as_str) {
+                            return StreamEvent::Text(t.to_string());
+                        }
+                    }
+                    StreamEvent::Other
+                }
+                _ => StreamEvent::Other,
             }
-            StreamEvent::Other
         }
         Some("result") => {
             let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false)
@@ -674,6 +701,19 @@ mod tests {
             StreamEvent::Text(t) => assert_eq!(t, "hi"),
             _ => panic!("expected text"),
         }
+    }
+
+    #[test]
+    fn parse_text_block_start_is_break() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}}"#;
+        assert!(matches!(parse_claude_line(line), StreamEvent::BlockBreak));
+    }
+
+    #[test]
+    fn parse_tool_block_start_is_ignored() {
+        // A tool_use block starting must NOT insert a paragraph break.
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"x","name":"Read"}}}"#;
+        assert!(matches!(parse_claude_line(line), StreamEvent::Other));
     }
 
     #[test]
