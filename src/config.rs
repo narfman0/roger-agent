@@ -85,6 +85,15 @@ pub struct BackendConfig {
     pub model: String,
     #[serde(default)]
     pub api_key_env: String,
+    /// Whether this backend's model can see images inline. Subprocess backends
+    /// (claude-code/opencode) receive images as on-disk paths their own Read tool
+    /// opens, so this only matters for OpenAI HTTP backends — and even there it's
+    /// documentation today (v1 hands images to the coding agent by path). Default
+    /// false; set true for known vision-capable HTTP models.
+    // v1 hands images to the coding agent by path, so this is not read yet.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub vision: bool,
 }
 
 impl BackendConfig {
@@ -115,6 +124,18 @@ pub struct CommsConfig {
     /// has been identified for the room. `~` is expanded.
     #[serde(default)]
     pub default_workdir: Option<String>,
+    /// Master switch for attachment handling (images/files/videos). When false,
+    /// non-text/non-audio messages are ignored as before.
+    #[serde(default = "default_true")]
+    pub attachments_enabled: bool,
+    /// Size cap (bytes) for *eager* download. Larger (or opaque) attachments are
+    /// noted by metadata only and fetched lazily on request. Default 25 MB.
+    #[serde(default = "default_attachment_max_eager")]
+    pub attachment_max_eager_bytes: u64,
+    /// Directory root for saved attachments (`~` expanded). Per-room subdirs are
+    /// created under it. Defaults to `<state>/attachments` when unset.
+    #[serde(default)]
+    pub attachment_dir: Option<String>,
 }
 
 fn default_sync_budget() -> u64 { 7000 }
@@ -123,6 +144,7 @@ fn default_absolute_ceiling() -> u64 { 1800000 }
 fn default_soft_worker_cap() -> usize { 4 }
 fn default_max_concurrent_children() -> usize { 3 }
 fn default_edit_debounce() -> u64 { 600 }
+fn default_attachment_max_eager() -> u64 { 26_214_400 }
 
 impl Default for CommsConfig {
     fn default() -> Self {
@@ -134,6 +156,9 @@ impl Default for CommsConfig {
             max_concurrent_children: default_max_concurrent_children(),
             edit_debounce_ms: default_edit_debounce(),
             default_workdir: None,
+            attachments_enabled: true,
+            attachment_max_eager_bytes: default_attachment_max_eager(),
+            attachment_dir: None,
         }
     }
 }
@@ -158,6 +183,11 @@ pub struct RoomConfig {
     /// `[context].operating_file`. `~` is expanded.
     #[serde(default)]
     pub operating_file: Option<String>,
+    /// Whether attachments are accepted in this room (default true). A bare upload
+    /// (no caption) bypasses the mention gate; captioned/mid-task uploads still
+    /// ride the normal flow.
+    #[serde(default = "default_true")]
+    pub attachments: bool,
 }
 
 fn default_require_mention() -> bool { true }
@@ -170,6 +200,7 @@ impl Default for RoomConfig {
             system_prompt: None,
             profile: None,
             operating_file: None,
+            attachments: true,
         }
     }
 }

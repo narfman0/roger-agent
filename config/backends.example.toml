@@ -15,6 +15,11 @@ kind = "open-ai"
 base_url = "http://srv:4000"
 model = "claude-sonnet"
 api_key_env = "GATEWAY_VKEY"
+# vision = true declares an OpenAI HTTP model can see images inline. Subprocess
+# backends (claude-code/open-code) always receive images as on-disk paths, so this
+# only matters there — and is documentation today (v1 hands images to the coding
+# agent by path; inline vision content-parts are not wired yet).
+# vision = false
 
 [backends.cloud-heavy]
 # kind: "open-ai" | "claude-code" | "open-code"

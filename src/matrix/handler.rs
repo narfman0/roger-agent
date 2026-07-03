@@ -1,3 +1,4 @@
+use super::attachment;
 use crate::{
     audio::SpeachesClient,
     config::{AgentConfig, CommsConfig, CommsMode, CompactionConfig, RoomConfig},
@@ -216,6 +217,8 @@ pub struct BotCtx {
     pub rooms: Arc<RoomQueues>,
     /// Reusable skills (read/write/index), injected + editable.
     pub skills: Arc<SkillStore>,
+    /// Root directory for saved attachments; per-room subdirs are created under it.
+    pub attachment_dir: Arc<PathBuf>,
 }
 
 impl BotCtx {
@@ -286,6 +289,9 @@ struct Turn {
     room: Room,
     sender: String,
     body: String,
+    /// When true, this turn skips the mention gate (used for bare attachment
+    /// uploads, which carry no text to @-mention the bot with).
+    bypass_mention: bool,
 }
 
 /// Per-room FIFO workers. Each room has a single spawned worker that processes its
@@ -335,7 +341,10 @@ pub async fn handle_message(
         return;
     }
 
-    // Resolve message body — text directly, audio via transcription.
+    // Resolve message body — text directly, audio via transcription, and
+    // image/file/video via the attachment path. `bypass_mention` lets a bare
+    // upload (no caption) skip the mention gate.
+    let mut bypass_mention = false;
     let body = match &event.content.msgtype {
         MessageType::Text(text) => text.body.clone(),
 
@@ -357,7 +366,20 @@ pub async fn handle_message(
             }
         }
 
-        _ => return,
+        other => match attachment::attachment_meta(other) {
+            Some(att) => {
+                match handle_attachment(&event, &room, &client, &ctx, att).await {
+                    Some((synthetic_body, bare)) => {
+                        bypass_mention = bare;
+                        synthetic_body
+                    }
+                    // Attachments disabled (globally or for this room), or an ack
+                    // was already sent for a bare upload — nothing to enqueue.
+                    None => return,
+                }
+            }
+            None => return,
+        },
     };
 
     // Control slash commands bypass the room queue (so `/cancel`, `/status`, etc.
@@ -376,17 +398,18 @@ pub async fn handle_message(
     bot.rooms.enqueue(
         bot,
         room_id,
-        Turn { room, sender: event.sender.to_string(), body },
+        Turn { room, sender: event.sender.to_string(), body, bypass_mention },
     );
 }
 
 /// Process one queued turn for a room: mention gate, persist, assemble context, and
 /// dispatch the response job holding vs. releasing the room per the comms mode.
 async fn process_turn(ctx: &BotCtx, agentic_gate: &Arc<Semaphore>, turn: Turn) {
-    let Turn { room, sender, body } = turn;
+    let Turn { room, sender, body, bypass_mention } = turn;
     let room_id = room.room_id().to_string();
 
-    // Mention gate — read the (reloadable) per-room config.
+    // Mention gate — read the (reloadable) per-room config. Bare attachment
+    // uploads bypass it (they carry no text to mention the bot with).
     let require_mention = ctx
         .state
         .read()
@@ -395,7 +418,7 @@ async fn process_turn(ctx: &BotCtx, agentic_gate: &Arc<Semaphore>, turn: Turn) {
         .get(&room_id)
         .map(|r| r.require_mention)
         .unwrap_or(true);
-    if require_mention && !ctx.is_mentioned(&body) {
+    if require_mention && !bypass_mention && !ctx.is_mentioned(&body) {
         return;
     }
 
@@ -1072,6 +1095,102 @@ async fn handle_model_command(arg: Option<&str>, room_id: &str, ctx: &BotCtx) ->
     }
 }
 
+/// Handle a file-bearing message. Returns:
+/// - `Some((body, bypass_mention))` — enqueue a normal turn with this synthetic
+///   body (attachment summary, plus any caption) — used when the upload carries a
+///   caption or the room has an in-flight job (so the LLM acts on it now).
+/// - `None` — nothing to enqueue: attachments are disabled for the room, or this
+///   was a bare upload for which a templated ack was already sent (and recorded to
+///   history so a follow-up turn has context).
+async fn handle_attachment(
+    event: &OriginalSyncRoomMessageEvent,
+    room: &Room,
+    client: &Client,
+    ctx: &BotCtx,
+    att: attachment::Attachment,
+) -> Option<(String, bool)> {
+    let room_id = room.room_id().to_string();
+
+    // Gate: global switch + per-room flag (both default true).
+    let (enabled, max_eager) = {
+        let st = ctx.state.read().await;
+        let room_ok = st
+            .room_configs
+            .get(&room_id)
+            .map(|r| r.attachments)
+            .unwrap_or(true);
+        (st.comms.attachments_enabled && room_ok, st.comms.attachment_max_eager_bytes)
+    };
+    if !enabled {
+        info!(room = %room_id, "attachment ignored (disabled): {}", att.filename);
+        return None;
+    }
+
+    // Eager-small / lazy-large: download images and safe small files now; leave
+    // videos and oversized/opaque payloads for a later on-demand fetch.
+    let saved = if att.should_download_eager(max_eager) {
+        let dir = ctx.attachment_dir.join(sanitize_room_id(&room_id));
+        let unique = sanitize_event_id(event.event_id.as_str());
+        match att.download_to(client, &dir, &unique).await {
+            Ok(path) => {
+                info!(room = %room_id, "saved attachment to {}", path.display());
+                Some(path)
+            }
+            Err(e) => {
+                warn!(room = %room_id, "attachment download failed: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let summary = att.summary_line(saved.as_deref());
+
+    // Decide ack-vs-work: a caption, or an in-flight job in this room, means the
+    // user has given (or is mid-) context — treat as a normal turn. Otherwise it's
+    // a bare drop: send a templated ack and record the attachment to history so a
+    // follow-up ("summarize it") has the context.
+    let has_active_job = ctx.workers.list().iter().any(|j| j.room == room_id);
+    let caption = att.caption.clone().filter(|c| !c.trim().is_empty());
+
+    if caption.is_none() && !has_active_job {
+        let ack = att.ack_line(saved.as_deref());
+        if let Err(e) = ctx.history.append(&room_id, ChatMessage::user(&summary)) {
+            warn!("failed to save attachment to history: {}", e);
+        }
+        if let Err(e) = room.send(RoomMessageEventContent::text_plain(&ack)).await {
+            warn!("failed to send attachment ack: {}", e);
+        }
+        return None;
+    }
+
+    // Captioned / mid-task: prepend the summary to the caption (if any) and let
+    // the normal turn flow respond against the file.
+    let body = match caption {
+        Some(c) => format!("{}\n{}", summary, c),
+        None => summary,
+    };
+    Some((body, true))
+}
+
+/// Reduce a room id to a filesystem-safe directory name.
+fn sanitize_room_id(room_id: &str) -> String {
+    room_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' })
+        .collect()
+}
+
+/// Reduce an event id (`$...`) to a filesystem-safe unique prefix.
+fn sanitize_event_id(event_id: &str) -> String {
+    let s: String = event_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+    if s.is_empty() { "event".to_string() } else { s }
+}
+
 async fn transcribe_audio(
     client: &Client,
     audio: &AudioMessageEventContent,
@@ -1129,6 +1248,7 @@ mod tests {
                 system_prompt: None,
                 profile: Some("reason".into()),
                 operating_file: None,
+                attachments: true,
             },
         );
         let mut profile_comms = HashMap::new();
@@ -1203,6 +1323,7 @@ mod tests {
             memory: Arc::new(MemoryStore::new(dir.path(), None)),
             rooms: Arc::new(RoomQueues::default()),
             skills: Arc::new(SkillStore::new(dir.path(), dir.path())),
+            attachment_dir: Arc::new(dir.path().join("attachments")),
         }
     }
 

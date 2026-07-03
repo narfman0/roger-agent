@@ -243,6 +243,15 @@ async fn main() -> Result<()> {
         .collect();
     let workers = Arc::new(workers::Workers::new(cfg.comms.soft_worker_cap));
 
+    // Root dir for saved attachments (per-room subdirs created under it).
+    let attachment_dir = Arc::new(
+        cfg.comms
+            .attachment_dir
+            .as_deref()
+            .map(config::expand_tilde)
+            .unwrap_or_else(|| session_dir.join("attachments")),
+    );
+
     let state = Arc::new(RwLock::new(ReloadableState {
         llms,
         system_prompt: cfg.system_prompt,
@@ -278,6 +287,7 @@ async fn main() -> Result<()> {
         memory,
         rooms: Arc::new(matrix::handler::RoomQueues::default()),
         skills,
+        attachment_dir,
     };
 
     // Spawn the optional web control panel (after bot_ctx is built so we can clone it)
