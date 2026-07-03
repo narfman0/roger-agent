@@ -6,6 +6,9 @@ description = "Matrix-native AI orchestrator agent"
 
 [dependencies]
 matrix-sdk = { version = "0.8", default-features = false, features = ["e2e-encryption", "automatic-room-key-forwarding", "sqlite", "rustls-tls"] }
+# Force SQLite to be compiled from source so cross-compiling (aarch64) doesn't
+# need a target libsqlite3 to link against.
+rusqlite = { version = "0.31", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
