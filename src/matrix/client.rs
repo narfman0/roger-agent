@@ -16,12 +16,13 @@ struct PersistedSession {
     device_id: String,
 }
 
-pub async fn build_client(homeserver: &str, data_dir: &Path) -> Result<Client> {
+pub async fn build_client(homeserver: &str, data_dir: &Path, db_dir: &Path) -> Result<Client> {
     std::fs::create_dir_all(data_dir)?;
+    std::fs::create_dir_all(db_dir)?;
 
     let client = Client::builder()
         .homeserver_url(homeserver)
-        .sqlite_store(data_dir, None)
+        .sqlite_store(db_dir, None)
         .build()
         .await?;
 

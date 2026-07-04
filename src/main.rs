@@ -39,6 +39,13 @@ fn resolve_state_dir() -> PathBuf {
     crate::config::expand_tilde(&raw)
 }
 
+/// Resolve roger's config directory: `ROGER_CONFIG_DIR` if set, else `~/.roger/config`.
+/// Defaults to under the state dir so all user-specific files live in one place.
+fn resolve_config_dir() -> PathBuf {
+    let raw = std::env::var("ROGER_CONFIG_DIR").unwrap_or_else(|_| "~/.roger/config".to_string());
+    crate::config::expand_tilde(&raw)
+}
+
 /// Initialize tracing: human-readable to stderr, JSON with daily rotation to a
 /// log directory (`ROGER_LOG_DIR`, default `<state_dir>/logs`). The returned
 /// guard must be kept alive for the lifetime of the process so the non-blocking
@@ -128,8 +135,13 @@ async fn main() -> Result<()> {
 
     info!("state dir: {}", state_dir.display());
 
-    let config_dir = PathBuf::from("config");
+    let config_dir = resolve_config_dir();
+    std::fs::create_dir_all(&config_dir)?;
+    info!("config dir: {}", config_dir.display());
     let cfg = Config::load(&config_dir)?;
+
+    let db_dir = state_dir.join("db");
+    std::fs::create_dir_all(&db_dir)?;
 
     info!("roger starting — homeserver: {}", cfg.matrix_homeserver);
     info!("allowlist: {:?}", cfg.room_allowlist);
@@ -200,7 +212,7 @@ async fn main() -> Result<()> {
     }
 
     let session_dir = state_dir;
-    let client = matrix::client::build_client(&cfg.matrix_homeserver, &session_dir).await?;
+    let client = matrix::client::build_client(&cfg.matrix_homeserver, &session_dir, &db_dir).await?;
     matrix::client::login(&client, &cfg.matrix_user, &cfg.matrix_password, &session_dir).await?;
 
     let bot_user_id = client

@@ -622,18 +622,22 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// The committed profiles.toml must parse, including per-room overrides.
+    /// profiles.toml schema: chat profile required; per-room system_prompt is optional.
     #[test]
-    fn committed_profiles_toml_parses() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config/profiles.toml");
-        let s = fs::read_to_string(path).expect("read profiles.toml");
-        let parsed: ProfilesFile = toml::from_str(&s).expect("parse profiles.toml");
+    fn profiles_toml_schema_parses() {
+        let toml = r#"
+            [profiles.chat]
+            backend = "x"
+            [profiles.code]
+            backend = "y"
+            [rooms."!a:b"]
+            name = "Test Room"
+            require_mention = false
+            system_prompt = "You are a test bot."
+        "#;
+        let parsed: ProfilesFile = toml::from_str(toml).expect("parse profiles toml");
         assert!(parsed.profiles.contains_key("chat"), "chat profile required");
-        // At least one room defines a system_prompt override.
-        assert!(
-            parsed.rooms.values().any(|r| r.system_prompt.is_some()),
-            "expected a per-room system_prompt example"
-        );
+        assert!(parsed.rooms.values().any(|r| r.system_prompt.is_some()));
     }
 
     #[test]
