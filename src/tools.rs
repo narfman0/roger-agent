@@ -125,6 +125,31 @@ pub fn tool_definitions() -> Value {
         {
             "type": "function",
             "function": {
+                "name": "search_history",
+                "description": "Search past conversation history across rooms for messages containing a keyword or phrase. Returns matching messages with room context. Use when the user asks about something discussed before, or to recall a past decision.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Keyword or phrase to search for (case-insensitive)"
+                        },
+                        "room": {
+                            "type": "string",
+                            "description": "Limit search to a specific room ID (optional; omit to search all rooms)"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max number of matching messages to return (default 10, max 50)"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "read_skill",
                 "description": "Load the full steps of a named skill listed in the Skills section.",
                 "parameters": {
@@ -199,6 +224,8 @@ pub struct ToolExecutor {
     mcp: Option<Arc<McpManager>>,
     /// Skill store for read_skill / write_skill.
     skills: Option<Arc<crate::skills::SkillStore>>,
+    /// History store for search_history.
+    history: Option<Arc<crate::history::HistoryStore>>,
 }
 
 impl ToolExecutor {
@@ -220,7 +247,13 @@ impl ToolExecutor {
             room_workdirs,
             mcp,
             skills,
+            history: None,
         }
+    }
+
+    pub fn with_history(mut self, history: Arc<crate::history::HistoryStore>) -> Self {
+        self.history = Some(history);
+        self
     }
 
     /// Connected MCP servers + total MCP tools (for `/status`).
@@ -329,6 +362,15 @@ impl ToolExecutor {
                             Err(e) => format!("error: {}", e),
                         }
                     }
+                }
+            }
+            "search_history" => {
+                let query = args["query"].as_str().unwrap_or("").to_string();
+                let room_filter = args["room"].as_str().map(|s| s.to_string());
+                let limit = args["limit"].as_u64().unwrap_or(10).min(50) as usize;
+                match &self.history {
+                    Some(h) => search_history(h, &query, room_filter.as_deref(), limit),
+                    None => "error: history search is not configured".to_string(),
                 }
             }
             "run_subagent" => {
@@ -499,6 +541,67 @@ fn list_dir(path: &str) -> String {
         lines.push("  (empty)".into());
     }
     lines.join("\n")
+}
+
+/// Case-insensitive substring search across room history files.
+/// Returns up to `limit` matching messages formatted for LLM consumption.
+fn search_history(
+    history: &crate::history::HistoryStore,
+    query: &str,
+    room_filter: Option<&str>,
+    limit: usize,
+) -> String {
+    if query.is_empty() {
+        return "error: query must not be empty".to_string();
+    }
+    let query_lower = query.to_lowercase();
+    let rooms: Vec<String> = match room_filter {
+        Some(r) => vec![r.to_string()],
+        None => history.list_room_ids(),
+    };
+    if rooms.is_empty() {
+        return "No history found.".to_string();
+    }
+
+    let mut results: Vec<String> = Vec::new();
+    'outer: for room_id in &rooms {
+        let msgs = history.load(room_id);
+        for (i, msg) in msgs.iter().enumerate() {
+            if msg.content.to_lowercase().contains(&query_lower) {
+                // Include one message of context before and after the match.
+                let start = i.saturating_sub(1);
+                let end = (i + 2).min(msgs.len());
+                let ctx: Vec<String> = msgs[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(j, m)| {
+                        let marker = if start + j == i { ">>>" } else { "   " };
+                        let snippet = if m.content.len() > 300 {
+                            format!("{}…", &m.content[..300])
+                        } else {
+                            m.content.clone()
+                        };
+                        format!("{} [{}] {}", marker, m.role, snippet)
+                    })
+                    .collect();
+                results.push(format!("Room: {}\n{}", room_id, ctx.join("\n")));
+                if results.len() >= limit {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    if results.is_empty() {
+        format!("No messages found matching '{}'.", query)
+    } else {
+        format!(
+            "Found {} match(es) for '{}':\n\n{}",
+            results.len(),
+            query,
+            results.join("\n\n---\n\n")
+        )
+    }
 }
 
 // ── SearXNG response types ──────────────────────────────────────────────────
@@ -715,7 +818,7 @@ mod tests {
     fn executor_tool_definitions_returns_native_without_mcp() {
         let exec = ToolExecutor::with_projects(None, HashMap::new(), None, None, None);
         let arr = exec.tool_definitions();
-        assert_eq!(arr.as_array().unwrap().len(), 8);
+        assert_eq!(arr.as_array().unwrap().len(), 9);
     }
 
     struct MockHost;
@@ -731,7 +834,7 @@ mod tests {
     #[tokio::test]
     async fn run_subagent_advertised_only_when_scoped() {
         let exec = ToolExecutor::with_projects(None, HashMap::new(), None, None, None);
-        assert_eq!(exec.tool_definitions().as_array().unwrap().len(), 8);
+        assert_eq!(exec.tool_definitions().as_array().unwrap().len(), 9);
 
         let host: Arc<dyn SubagentHost> = Arc::new(MockHost);
         let defs = SUBAGENT.scope(host, async { exec.tool_definitions() }).await;
@@ -768,7 +871,7 @@ mod tests {
         let defs = tool_definitions();
         assert!(defs.is_array());
         let arr = defs.as_array().unwrap();
-        assert_eq!(arr.len(), 8);
+        assert_eq!(arr.len(), 9);
         let names: Vec<&str> = arr
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -777,8 +880,90 @@ mod tests {
             names,
             &[
                 "web_search", "web_fetch", "read_file", "write_file", "list_dir",
-                "read_skill", "write_skill", "set_workdir"
+                "search_history", "read_skill", "write_skill", "set_workdir"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn search_history_returns_no_results_on_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = Arc::new(crate::history::HistoryStore::new(dir.path().join("h")).unwrap());
+        let result = search_history(&history, "hello", None, 10);
+        assert!(result.contains("No") || result.contains("no"), "got: {}", result);
+    }
+
+    #[tokio::test]
+    async fn search_history_finds_message_in_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = Arc::new(crate::history::HistoryStore::new(dir.path().join("h")).unwrap());
+        let msg = crate::history::ChatMessage {
+            role: "user".to_string(),
+            content: "let's talk about rust and memory safety".to_string(),
+        };
+        history.append("!room1:server", msg).unwrap();
+
+        let result = search_history(&history, "memory safety", None, 10);
+        assert!(result.contains("memory safety"), "got: {}", result);
+        assert!(result.contains("room1"), "got: {}", result);
+    }
+
+    #[tokio::test]
+    async fn search_history_is_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = Arc::new(crate::history::HistoryStore::new(dir.path().join("h")).unwrap());
+        let msg = crate::history::ChatMessage {
+            role: "assistant".to_string(),
+            content: "The quick brown FOX jumps".to_string(),
+        };
+        history.append("!room1:server", msg).unwrap();
+
+        let result = search_history(&history, "quick brown fox", None, 10);
+        assert!(result.contains("FOX"), "got: {}", result);
+    }
+
+    #[tokio::test]
+    async fn search_history_room_filter_limits_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = Arc::new(crate::history::HistoryStore::new(dir.path().join("h")).unwrap());
+        let msg = crate::history::ChatMessage {
+            role: "user".to_string(),
+            content: "needle in room A".to_string(),
+        };
+        history.append("!roomA:server", msg).unwrap();
+        let msg2 = crate::history::ChatMessage {
+            role: "user".to_string(),
+            content: "needle in room B".to_string(),
+        };
+        history.append("!roomB:server", msg2).unwrap();
+
+        let result = search_history(&history, "needle", Some("!roomA:server"), 10);
+        assert!(result.contains("room A"), "got: {}", result);
+        assert!(!result.contains("room B"), "got: {}", result);
+    }
+
+    #[tokio::test]
+    async fn search_history_respects_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = Arc::new(crate::history::HistoryStore::new(dir.path().join("h")).unwrap());
+        for i in 0..10 {
+            let msg = crate::history::ChatMessage {
+                role: "user".to_string(),
+                content: format!("hit number {}", i),
+            };
+            history.append("!room:server", msg).unwrap();
+        }
+        let result = search_history(&history, "hit number", None, 3);
+        // Each match block starts with "Room:" — count those.
+        let count = result.matches("Room:").count();
+        assert!(count <= 3, "expected ≤3 match blocks, got {}", count);
+    }
+
+    #[tokio::test]
+    async fn search_history_empty_query_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = Arc::new(crate::history::HistoryStore::new(dir.path().join("h")).unwrap());
+        let result = search_history(&history, "", None, 10);
+        assert!(result.starts_with("error:"), "got: {}", result);
     }
 }

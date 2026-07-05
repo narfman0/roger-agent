@@ -199,20 +199,6 @@ async fn main() -> Result<()> {
     // Reusable skills store (committed config/skills + learned ~/.roger/skills).
     let skills = Arc::new(skills::SkillStore::new(&config_dir, &state_dir));
 
-    // Build tool executor (web/file tools, set_workdir, MCP, skills)
-    let tool_executor = Arc::new(tools::ToolExecutor::with_projects(
-        cfg.searxng_url.clone(),
-        projects,
-        Some(room_workdirs.clone()),
-        Some(mcp.clone()),
-        Some(skills.clone()),
-    ));
-    if let Some(url) = &cfg.searxng_url {
-        info!("searxng: {} (web_search enabled)", url);
-    } else {
-        info!("SEARXNG_URL not set — web_search will return an error when called");
-    }
-
     let session_dir = state_dir;
     let client = matrix::client::build_client(&cfg.matrix_homeserver, &session_dir, &db_dir).await?;
     matrix::client::login(&client, &cfg.matrix_user, &cfg.matrix_password, &session_dir).await?;
@@ -240,6 +226,20 @@ async fn main() -> Result<()> {
 
     let history = Arc::new(history::HistoryStore::new(session_dir.join("history"))?);
     info!("history store initialized");
+
+    // Build tool executor (web/file tools, set_workdir, MCP, skills)
+    let tool_executor = Arc::new(tools::ToolExecutor::with_projects(
+        cfg.searxng_url.clone(),
+        projects,
+        Some(room_workdirs.clone()),
+        Some(mcp.clone()),
+        Some(skills.clone()),
+    ).with_history(history.clone()));
+    if let Some(url) = &cfg.searxng_url {
+        info!("searxng: {} (web_search enabled)", url);
+    } else {
+        info!("SEARXNG_URL not set — web_search will return an error when called");
+    }
 
     // Load persisted /model overrides, dropping any that name a profile that
     // isn't built on this host.
