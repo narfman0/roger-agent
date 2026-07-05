@@ -114,6 +114,7 @@ async fn reload_on_sighup(config_dir: PathBuf, state: Arc<RwLock<ReloadableState
         st.memory_enabled = cfg.memory.enabled;
         st.memory_max_global_tokens = cfg.memory.max_global_tokens;
         st.memory_max_room_tokens = cfg.memory.max_room_tokens;
+        st.memory_max_tldr_tokens = cfg.memory.max_tldr_tokens;
         st.compaction = cfg.compaction;
         st.agents = cfg.agents;
         // Drop runtime /model overrides that point at a profile that no longer builds.
@@ -276,6 +277,7 @@ async fn main() -> Result<()> {
         memory_enabled: cfg.memory.enabled,
         memory_max_global_tokens: cfg.memory.max_global_tokens,
         memory_max_room_tokens: cfg.memory.max_room_tokens,
+        memory_max_tldr_tokens: cfg.memory.max_tldr_tokens,
         compaction: cfg.compaction,
         agents: cfg.agents,
     }));

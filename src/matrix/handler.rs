@@ -90,9 +90,12 @@ fn read_context_file(path: &str) -> String {
 
 /// Layer operating instructions and durable memory onto the base persona to form
 /// the full system prompt. Empty sections are skipped, so absent files add nothing.
+/// `tldr` (if non-empty) is injected first — before operating instructions — so it
+/// acts as a compact cold-start brief that any future session reads immediately.
 #[allow(clippy::too_many_arguments)]
 fn assemble_system_prompt(
     base: &str,
+    tldr: &str,
     operating_global: &str,
     operating_room: &str,
     memory_global: &str,
@@ -111,6 +114,7 @@ fn assemble_system_prompt(
         }
         out.push_str(body);
     };
+    section(Some("## Current state (TLDR)"), tldr);
     section(None, operating_global);
     section(None, operating_room);
     section(Some("## Memory (global)"), memory_global);
@@ -156,6 +160,7 @@ pub struct ReloadableState {
     /// Memory self-compaction caps (tokens).
     pub memory_max_global_tokens: usize,
     pub memory_max_room_tokens: usize,
+    pub memory_max_tldr_tokens: usize,
     /// Size-triggered history compaction settings.
     pub compaction: CompactionConfig,
     /// Named subagents (for run_subagent / /agent).
@@ -454,10 +459,14 @@ async fn process_turn(ctx: &BotCtx, agentic_gate: &Arc<Semaphore>, turn: Turn) {
     // are read fresh each turn, so edits take effect without a reload.
     let operating_global = op_global.as_deref().map(read_context_file).unwrap_or_default();
     let operating_room = op_room.as_deref().map(read_context_file).unwrap_or_default();
-    let (memory_global, memory_room) = if mem_enabled {
-        (ctx.memory.read_global(), ctx.memory.read_room(&room_id))
+    let (memory_global, memory_room, memory_tldr) = if mem_enabled {
+        (
+            ctx.memory.read_global(),
+            ctx.memory.read_room(&room_id),
+            ctx.memory.read_tldr(&room_id),
+        )
     } else {
-        (String::new(), String::new())
+        (String::new(), String::new(), String::new())
     };
     let skills_index = ctx
         .skills
@@ -468,6 +477,7 @@ async fn process_turn(ctx: &BotCtx, agentic_gate: &Arc<Semaphore>, turn: Turn) {
         .join("\n");
     let system_prompt = assemble_system_prompt(
         &base_prompt,
+        &memory_tldr,
         &operating_global,
         &operating_room,
         &memory_global,
@@ -700,14 +710,14 @@ async fn run_response_job(
 /// compaction task (summarize old turns + distill memory). Fast to call: it only
 /// reads config + the history size, then spawns.
 async fn maybe_compact(bot: &BotCtx, room_id: &str) {
-    let (cfg, llm, room_budget, max_global, max_room) = {
+    let (cfg, llm, room_budget, max_global, max_room, max_tldr) = {
         let st = bot.state.read().await;
         let cfg = st.compaction.clone();
         // The trigger scales with the room's own model window.
         let (room_llm, _) = st.llm_for_room(room_id);
         let room_budget = room_llm.history_token_budget(0);
         let llm = st.llms.get(&cfg.profile).cloned();
-        (cfg, llm, room_budget, st.memory_max_global_tokens, st.memory_max_room_tokens)
+        (cfg, llm, room_budget, st.memory_max_global_tokens, st.memory_max_room_tokens, st.memory_max_tldr_tokens)
     };
     if !cfg.enabled {
         return;
@@ -733,6 +743,7 @@ async fn maybe_compact(bot: &BotCtx, room_id: &str) {
             keep_recent_turns: cfg.keep_recent_turns,
             max_global_tokens: max_global,
             max_room_tokens: max_room,
+            max_tldr_tokens: max_tldr,
         },
     ));
 }
@@ -1289,6 +1300,7 @@ mod tests {
             memory_enabled: true,
             memory_max_global_tokens: 1500,
             memory_max_room_tokens: 3000,
+            memory_max_tldr_tokens: 300,
             compaction: CompactionConfig::default(),
             agents: HashMap::new(),
         }
@@ -1427,6 +1439,40 @@ mod tests {
         let max = Duration::from_millis(1000);
         // Unchanged text never flushes, even past the ceiling.
         assert!(!should_flush(false, Duration::from_secs(5), true, min, max));
+    }
+
+    #[test]
+    fn assemble_system_prompt_tldr_at_top() {
+        let result = assemble_system_prompt(
+            "You are a bot.",
+            "Working on feature X. Last decision: use GLM. Next: write tests.",
+            "Be concise.",
+            "",
+            "- global fact",
+            "- room fact",
+            "",
+        );
+        // TLDR appears before operating instructions
+        let tldr_pos = result.find("Working on feature X").unwrap();
+        let op_pos = result.find("Be concise.").unwrap();
+        let global_pos = result.find("global fact").unwrap();
+        assert!(tldr_pos < op_pos, "TLDR must come before operating instructions");
+        assert!(op_pos < global_pos, "operating must come before memory");
+    }
+
+    #[test]
+    fn assemble_system_prompt_no_tldr_skips_section() {
+        let result = assemble_system_prompt(
+            "You are a bot.",
+            "",
+            "Be concise.",
+            "",
+            "",
+            "",
+            "",
+        );
+        assert!(!result.contains("## Current state (TLDR)"));
+        assert!(result.contains("Be concise."));
     }
 
     #[tokio::test]

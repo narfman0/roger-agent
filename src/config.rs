@@ -237,10 +237,15 @@ pub struct MemoryConfig {
     pub max_global_tokens: usize,
     #[serde(default = "default_max_room_tokens")]
     pub max_room_tokens: usize,
+    /// Max tokens for the per-room TLDR written at each compaction. Injected at the
+    /// top of the system prompt so future sessions get an instant cold-start brief.
+    #[serde(default = "default_max_tldr_tokens")]
+    pub max_tldr_tokens: usize,
 }
 
 fn default_max_global_tokens() -> usize { 1500 }
 fn default_max_room_tokens() -> usize { 3000 }
+fn default_max_tldr_tokens() -> usize { 300 }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
@@ -249,6 +254,7 @@ impl Default for MemoryConfig {
             global_file: None,
             max_global_tokens: default_max_global_tokens(),
             max_room_tokens: default_max_room_tokens(),
+            max_tldr_tokens: default_max_tldr_tokens(),
         }
     }
 }

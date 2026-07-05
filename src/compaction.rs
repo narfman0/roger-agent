@@ -16,6 +16,8 @@ pub struct CompactionParams {
     pub keep_recent_turns: usize,
     pub max_global_tokens: usize,
     pub max_room_tokens: usize,
+    /// Max tokens for the per-room TLDR injected at the top of future system prompts.
+    pub max_tldr_tokens: usize,
 }
 
 static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -68,7 +70,9 @@ async fn run(
     let (old, recent) = msgs.split_at(split);
 
     let sys = "You compact a chat assistant's memory. Given an earlier conversation \
-        excerpt, output three sections with EXACTLY these headers and nothing before them:\n\
+        excerpt, output four sections with EXACTLY these headers and nothing before them:\n\
+        ### TLDR\n(2-3 sentences: current project/topic, last decision, what's next — \
+        written so a future session can orient instantly without reading history)\n\
         ### SUMMARY\n(a concise summary preserving decisions, facts, and open threads)\n\
         ### ROOM_MEMORY\n(durable facts specific to THIS room worth remembering long-term, \
         as short bullets; or 'none')\n\
@@ -80,6 +84,7 @@ async fn run(
         .chat(&[ChatMessage::system(sys), ChatMessage::user(&user)])
         .await?;
 
+    let tldr = section(&out, "### TLDR").unwrap_or_default();
     let summary = section(&out, "### SUMMARY").unwrap_or_default();
     let room_mem = section(&out, "### ROOM_MEMORY").unwrap_or_default();
     let global_mem = section(&out, "### GLOBAL_MEMORY").unwrap_or_default();
@@ -98,6 +103,18 @@ async fn run(
     new_hist.extend(recent.iter().cloned());
     history.rewrite(room_id, new_hist)?;
     info!(room = %room_id, compacted = old.len(), kept = recent.len(), "compacted history");
+
+    // Always rewrite the TLDR fresh — it's a point-in-time snapshot, not append.
+    if is_content(&tldr) {
+        let tldr_final = if crate::history::estimate_tokens(&tldr) > params.max_tldr_tokens {
+            condense(llm, &tldr, params.max_tldr_tokens).await.unwrap_or(tldr)
+        } else {
+            tldr
+        };
+        if let Err(e) = memory.rewrite_tldr(room_id, &tldr_final) {
+            warn!("failed to write TLDR for {}: {}", room_id, e);
+        }
+    }
 
     if is_content(&room_mem) {
         memory.append_room(room_id, &room_mem)?;
@@ -164,11 +181,19 @@ mod tests {
 
     #[test]
     fn section_extracts_between_headers() {
-        let out = "### SUMMARY\nchatted about cats.\n### ROOM_MEMORY\n- likes cats\n### GLOBAL_MEMORY\nnone";
+        let out = "### TLDR\nworking on cats.\n### SUMMARY\nchatted about cats.\n### ROOM_MEMORY\n- likes cats\n### GLOBAL_MEMORY\nnone";
+        assert_eq!(section(out, "### TLDR").unwrap(), "working on cats.");
         assert_eq!(section(out, "### SUMMARY").unwrap(), "chatted about cats.");
         assert_eq!(section(out, "### ROOM_MEMORY").unwrap(), "- likes cats");
         assert_eq!(section(out, "### GLOBAL_MEMORY").unwrap(), "none");
         assert!(section(out, "### MISSING").is_none());
+    }
+
+    #[test]
+    fn section_handles_tldr_only() {
+        let out = "### TLDR\nJust a brief.\n### SUMMARY\nLonger detail.\n### ROOM_MEMORY\nnone\n### GLOBAL_MEMORY\nnone";
+        assert_eq!(section(out, "### TLDR").unwrap(), "Just a brief.");
+        assert_eq!(section(out, "### SUMMARY").unwrap(), "Longer detail.");
     }
 
     #[test]

@@ -12,6 +12,7 @@ use std::sync::Mutex;
 pub struct MemoryStore {
     global_path: PathBuf,
     rooms_dir: PathBuf,
+    tldr_dir: PathBuf,
     /// Serializes writes so concurrent compactions (e.g. two rooms appending to the
     /// shared global file) don't clobber each other's read-modify-write.
     write_lock: Mutex<()>,
@@ -29,6 +30,7 @@ impl MemoryStore {
         MemoryStore {
             global_path,
             rooms_dir: base.join("rooms"),
+            tldr_dir: base.join("tldr"),
             write_lock: Mutex::new(()),
         }
     }
@@ -37,6 +39,30 @@ impl MemoryStore {
         // Same sanitization as HistoryStore.
         let safe = room_id.replace(['!', ':', '/'], "_");
         self.rooms_dir.join(format!("{}.md", safe))
+    }
+
+    fn tldr_path(&self, room_id: &str) -> PathBuf {
+        let safe = room_id.replace(['!', ':', '/'], "_");
+        self.tldr_dir.join(format!("{}.md", safe))
+    }
+
+    /// Current TLDR for a room — a short cold-start summary written by compaction.
+    /// Empty when no compaction has run yet.
+    pub fn read_tldr(&self, room_id: &str) -> String {
+        read_trimmed(&self.tldr_path(room_id))
+    }
+
+    /// Replace the room TLDR with a freshly compacted summary. Called by compaction;
+    /// always a full rewrite (not append) so it never accumulates stale content.
+    pub fn rewrite_tldr(&self, room_id: &str, content: &str) -> Result<()> {
+        let path = self.tldr_path(room_id);
+        let _g = self.write_lock.lock().unwrap();
+        write_atomic(&path, content)
+    }
+
+    /// Delete the TLDR for a room (for `/forget`).
+    pub fn clear_tldr(&self, room_id: &str) -> Result<()> {
+        remove_if_exists(&self.tldr_path(room_id))
     }
 
     /// Global memory text (empty if the file is missing or blank).
@@ -175,5 +201,35 @@ mod tests {
         std::fs::write(&custom, "custom").unwrap();
         let store = MemoryStore::new(dir.path(), Some(custom.to_str().unwrap()));
         assert_eq!(store.read_global(), "custom");
+    }
+
+    #[test]
+    fn tldr_read_write_clear() {
+        let dir = TempDir::new().unwrap();
+        let store = MemoryStore::new(dir.path(), None);
+        // Missing → empty
+        assert!(store.read_tldr("!r:s").is_empty());
+        // Write then read back
+        store.rewrite_tldr("!r:s", "  summary line  ").unwrap();
+        assert_eq!(store.read_tldr("!r:s"), "summary line");
+        // Rewrite replaces (not appends)
+        store.rewrite_tldr("!r:s", "new summary").unwrap();
+        assert_eq!(store.read_tldr("!r:s"), "new summary");
+        // Clear
+        store.clear_tldr("!r:s").unwrap();
+        assert!(store.read_tldr("!r:s").is_empty());
+    }
+
+    #[test]
+    fn tldr_rooms_are_isolated() {
+        let dir = TempDir::new().unwrap();
+        let store = MemoryStore::new(dir.path(), None);
+        store.rewrite_tldr("!a:s", "room a").unwrap();
+        store.rewrite_tldr("!b:s", "room b").unwrap();
+        assert_eq!(store.read_tldr("!a:s"), "room a");
+        assert_eq!(store.read_tldr("!b:s"), "room b");
+        store.clear_tldr("!a:s").unwrap();
+        assert!(store.read_tldr("!a:s").is_empty());
+        assert_eq!(store.read_tldr("!b:s"), "room b");
     }
 }
