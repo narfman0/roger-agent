@@ -744,6 +744,7 @@ async fn maybe_compact(bot: &BotCtx, room_id: &str) {
             max_global_tokens: max_global,
             max_room_tokens: max_room,
             max_tldr_tokens: max_tldr,
+            force: false,
         },
     ));
 }

@@ -374,6 +374,25 @@ impl Default for WorktreeConfig {
     }
 }
 
+/// Scheduled background tasks. Currently: nightly compaction of all active rooms.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SchedulerConfig {
+    /// Run a forced compaction of all rooms once per day at `hour` (UTC, 0-23).
+    #[serde(default = "default_true")]
+    pub nightly_compaction: bool,
+    /// UTC hour to trigger the nightly compaction (default 4 = 04:00 UTC).
+    #[serde(default = "default_nightly_hour")]
+    pub nightly_hour: u32,
+}
+
+fn default_nightly_hour() -> u32 { 4 }
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        SchedulerConfig { nightly_compaction: true, nightly_hour: default_nightly_hour() }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ProfilesFile {
     profiles: HashMap<String, ProfileConfig>,
@@ -394,6 +413,8 @@ struct ProfilesFile {
     #[serde(default)]
     compaction: Option<CompactionConfig>,
     #[serde(default)]
+    scheduler: Option<SchedulerConfig>,
+    #[serde(default)]
     rooms: HashMap<String, RoomConfig>,
     /// Known projects (name → path) the LLM can select via the `set_workdir` tool.
     #[serde(default)]
@@ -413,6 +434,7 @@ pub struct Config {
     pub context: ContextConfig,
     pub memory: MemoryConfig,
     pub compaction: CompactionConfig,
+    pub scheduler: SchedulerConfig,
     pub mcp: McpConfig,
     pub worktrees: WorktreeConfig,
     pub web: WebConfig,
@@ -492,6 +514,7 @@ impl Config {
             context: profiles_file.context.unwrap_or_default(),
             memory: profiles_file.memory.unwrap_or_default(),
             compaction: profiles_file.compaction.unwrap_or_default(),
+            scheduler: profiles_file.scheduler.unwrap_or_default(),
             mcp: profiles_file.mcp.unwrap_or_default(),
             worktrees: profiles_file.worktrees.unwrap_or_default(),
             web: profiles_file.web.unwrap_or_default(),

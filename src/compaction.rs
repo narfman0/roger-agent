@@ -18,6 +18,9 @@ pub struct CompactionParams {
     pub max_room_tokens: usize,
     /// Max tokens for the per-room TLDR injected at the top of future system prompts.
     pub max_tldr_tokens: usize,
+    /// Skip the minimum-message guard (used by the nightly scheduler to compact
+    /// all active rooms regardless of how full their history is).
+    pub force: bool,
 }
 
 static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -63,10 +66,12 @@ async fn run(
     params: &CompactionParams,
 ) -> Result<()> {
     let msgs = history.load(room_id);
-    if msgs.len() <= params.keep_recent_turns {
+    // When forced (e.g. nightly scheduler), compact even if under the keep threshold,
+    // treating the whole history as "old" so we get a fresh TLDR and memory distill.
+    if !params.force && msgs.len() <= params.keep_recent_turns {
         return Ok(());
     }
-    let split = msgs.len() - params.keep_recent_turns;
+    let split = msgs.len().saturating_sub(params.keep_recent_turns);
     let (old, recent) = msgs.split_at(split);
 
     let sys = "You compact a chat assistant's memory. Given an earlier conversation \

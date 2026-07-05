@@ -10,6 +10,7 @@ mod memory;
 mod metrics;
 mod room_profiles;
 mod room_workdirs;
+mod scheduler;
 mod skills;
 mod subprocess;
 mod tools;
@@ -284,6 +285,9 @@ async fn main() -> Result<()> {
 
     // Spawn the SIGHUP hot-reload listener
     tokio::spawn(reload_on_sighup(config_dir, state.clone()));
+
+    // Spawn the nightly compaction scheduler
+    scheduler::run_scheduler(cfg.scheduler.clone(), state.clone(), history.clone(), memory.clone()).await;
 
     let web_cfg = cfg.web.clone();
     let bot_ctx = BotCtx {

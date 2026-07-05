@@ -33,6 +33,8 @@ impl ChatMessage {
 
 pub struct HistoryStore {
     data_dir: PathBuf,
+    /// Sidecar file that persists the set of room IDs ever written.
+    known_rooms_path: PathBuf,
     /// Per-room mutation lock so a compaction rewrite and a concurrent append (or
     /// two appends) don't clobber each other's read-modify-write.
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -41,7 +43,30 @@ pub struct HistoryStore {
 impl HistoryStore {
     pub fn new(data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
-        Ok(HistoryStore { data_dir, locks: Mutex::new(HashMap::new()) })
+        let known_rooms_path = data_dir.join("known_rooms.json");
+        Ok(HistoryStore { data_dir, known_rooms_path, locks: Mutex::new(HashMap::new()) })
+    }
+
+    /// All room IDs that have ever had history written. Persisted across restarts
+    /// so the scheduler can compact rooms it hasn't seen this session.
+    pub fn list_room_ids(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.known_rooms_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Record a room ID in the sidecar (no-op if already present).
+    fn record_room(&self, room_id: &str) {
+        let mut known = self.list_room_ids();
+        if known.iter().any(|r| r == room_id) {
+            return;
+        }
+        known.push(room_id.to_string());
+        let _ = std::fs::write(
+            &self.known_rooms_path,
+            serde_json::to_string_pretty(&known).unwrap_or_default(),
+        );
     }
 
     fn path(&self, room_id: &str) -> PathBuf {
@@ -73,6 +98,7 @@ impl HistoryStore {
     }
 
     pub fn append(&self, room_id: &str, msg: ChatMessage) -> Result<()> {
+        self.record_room(room_id);
         let lock = self.lock_for(room_id);
         let _g = lock.lock().unwrap();
         let mut msgs = self.load(room_id);
@@ -83,6 +109,7 @@ impl HistoryStore {
     /// Replace a room's entire history (used by compaction). Serialized against
     /// appends via the per-room lock; written atomically.
     pub fn rewrite(&self, room_id: &str, msgs: Vec<ChatMessage>) -> Result<()> {
+        self.record_room(room_id);
         let lock = self.lock_for(room_id);
         let _g = lock.lock().unwrap();
         self.write_atomic(room_id, &msgs)
@@ -256,6 +283,42 @@ mod tests {
         assert_eq!(msgs[0].role, "system");
         assert_eq!(msgs[0].content, "summary");
         assert_eq!(msgs[1].content, "4");
+    }
+
+    #[test]
+    fn test_list_room_ids_empty() {
+        let (_dir, store) = temp_store();
+        assert!(store.list_room_ids().is_empty());
+    }
+
+    #[test]
+    fn test_list_room_ids_after_append() {
+        let (_dir, store) = temp_store();
+        store.append("!a:srv", ChatMessage::user("hi")).unwrap();
+        store.append("!b:srv", ChatMessage::user("hi")).unwrap();
+        let mut ids = store.list_room_ids();
+        ids.sort();
+        assert_eq!(ids, vec!["!a:srv", "!b:srv"]);
+    }
+
+    #[test]
+    fn test_list_room_ids_no_duplicates() {
+        let (_dir, store) = temp_store();
+        store.append("!a:srv", ChatMessage::user("1")).unwrap();
+        store.append("!a:srv", ChatMessage::user("2")).unwrap();
+        assert_eq!(store.list_room_ids().len(), 1);
+    }
+
+    #[test]
+    fn test_list_room_ids_persists_across_instances() {
+        let dir = TempDir::new().unwrap();
+        {
+            let store = HistoryStore::new(dir.path().to_path_buf()).unwrap();
+            store.append("!r:srv", ChatMessage::user("hello")).unwrap();
+        }
+        // New instance — reads sidecar from disk
+        let store2 = HistoryStore::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(store2.list_room_ids(), vec!["!r:srv"]);
     }
 
     #[test]
