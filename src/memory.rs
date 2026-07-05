@@ -13,6 +13,7 @@ pub struct MemoryStore {
     global_path: PathBuf,
     rooms_dir: PathBuf,
     tldr_dir: PathBuf,
+    digest_path: PathBuf,
     /// Serializes writes so concurrent compactions (e.g. two rooms appending to the
     /// shared global file) don't clobber each other's read-modify-write.
     write_lock: Mutex<()>,
@@ -31,6 +32,7 @@ impl MemoryStore {
             global_path,
             rooms_dir: base.join("rooms"),
             tldr_dir: base.join("tldr"),
+            digest_path: base.join("digest.md"),
             write_lock: Mutex::new(()),
         }
     }
@@ -63,6 +65,51 @@ impl MemoryStore {
     /// Delete the TLDR for a room (for `/forget`).
     pub fn clear_tldr(&self, room_id: &str) -> Result<()> {
         remove_if_exists(&self.tldr_path(room_id))
+    }
+
+    /// Return all (room_id, tldr) pairs where the TLDR is non-empty.
+    /// Used by the weekly digest to collect material from all rooms.
+    pub fn all_tldrs(&self) -> Vec<(String, String)> {
+        let entries = match std::fs::read_dir(&self.tldr_dir) {
+            Ok(e) => e,
+            Err(_) => return vec![],
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let content = read_trimmed(&path);
+            if content.is_empty() {
+                continue;
+            }
+            // Reverse the sanitization (best-effort display label).
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            out.push((stem, content));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Cross-room weekly digest synthesized by the scheduler (empty when not yet written).
+    pub fn read_digest(&self) -> String {
+        read_trimmed(&self.digest_path)
+    }
+
+    /// Replace the weekly digest (called by the scheduler after synthesis).
+    pub fn rewrite_digest(&self, content: &str) -> Result<()> {
+        let _g = self.write_lock.lock().unwrap();
+        write_atomic(&self.digest_path, content)
+    }
+
+    /// Delete the weekly digest.
+    pub fn clear_digest(&self) -> Result<()> {
+        remove_if_exists(&self.digest_path)
     }
 
     /// Global memory text (empty if the file is missing or blank).
@@ -231,5 +278,36 @@ mod tests {
         store.clear_tldr("!a:s").unwrap();
         assert!(store.read_tldr("!a:s").is_empty());
         assert_eq!(store.read_tldr("!b:s"), "room b");
+    }
+
+    #[test]
+    fn digest_read_write_clear() {
+        let dir = TempDir::new().unwrap();
+        let store = MemoryStore::new(dir.path(), None);
+        assert!(store.read_digest().is_empty());
+        store.rewrite_digest("cross-room summary").unwrap();
+        assert_eq!(store.read_digest(), "cross-room summary");
+        store.rewrite_digest("updated summary").unwrap();
+        assert_eq!(store.read_digest(), "updated summary");
+        store.clear_digest().unwrap();
+        assert!(store.read_digest().is_empty());
+    }
+
+    #[test]
+    fn all_tldrs_returns_nonempty_rooms() {
+        let dir = TempDir::new().unwrap();
+        let store = MemoryStore::new(dir.path(), None);
+        assert!(store.all_tldrs().is_empty());
+
+        store.rewrite_tldr("!roomA:srv", "alpha stuff").unwrap();
+        store.rewrite_tldr("!roomB:srv", "beta stuff").unwrap();
+        // Empty TLDR should be excluded.
+        store.rewrite_tldr("!roomC:srv", "  ").unwrap();
+
+        let tldrs = store.all_tldrs();
+        assert_eq!(tldrs.len(), 2);
+        let contents: Vec<&str> = tldrs.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(contents.contains(&"alpha stuff"));
+        assert!(contents.contains(&"beta stuff"));
     }
 }

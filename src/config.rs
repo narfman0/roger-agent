@@ -383,13 +383,29 @@ pub struct SchedulerConfig {
     /// UTC hour to trigger the nightly compaction (default 4 = 04:00 UTC).
     #[serde(default = "default_nightly_hour")]
     pub nightly_hour: u32,
+    /// Synthesize a cross-room weekly digest from all room TLDRs.
+    #[serde(default = "default_true")]
+    pub weekly_digest: bool,
+    /// Day of week to run the digest (0 = Sunday … 6 = Saturday, default 0).
+    #[serde(default)]
+    pub weekly_digest_day: u32,
+    /// UTC hour to run the digest (default 5 = 05:00 UTC, after nightly compaction).
+    #[serde(default = "default_weekly_digest_hour")]
+    pub weekly_digest_hour: u32,
 }
 
 fn default_nightly_hour() -> u32 { 4 }
+fn default_weekly_digest_hour() -> u32 { 5 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
-        SchedulerConfig { nightly_compaction: true, nightly_hour: default_nightly_hour() }
+        SchedulerConfig {
+            nightly_compaction: true,
+            nightly_hour: default_nightly_hour(),
+            weekly_digest: true,
+            weekly_digest_day: 0,
+            weekly_digest_hour: default_weekly_digest_hour(),
+        }
     }
 }
 

@@ -100,6 +100,7 @@ fn assemble_system_prompt(
     operating_room: &str,
     memory_global: &str,
     memory_room: &str,
+    digest: &str,
     skills: &str,
 ) -> String {
     let mut out = base.trim_end().to_string();
@@ -119,6 +120,7 @@ fn assemble_system_prompt(
     section(None, operating_room);
     section(Some("## Memory (global)"), memory_global);
     section(Some("## Memory (this room)"), memory_room);
+    section(Some("## Weekly digest (cross-room)"), digest);
     section(
         Some("## Skills\nReusable procedures — call `read_skill(name)` to load one:"),
         skills,
@@ -459,14 +461,15 @@ async fn process_turn(ctx: &BotCtx, agentic_gate: &Arc<Semaphore>, turn: Turn) {
     // are read fresh each turn, so edits take effect without a reload.
     let operating_global = op_global.as_deref().map(read_context_file).unwrap_or_default();
     let operating_room = op_room.as_deref().map(read_context_file).unwrap_or_default();
-    let (memory_global, memory_room, memory_tldr) = if mem_enabled {
+    let (memory_global, memory_room, memory_tldr, memory_digest) = if mem_enabled {
         (
             ctx.memory.read_global(),
             ctx.memory.read_room(&room_id),
             ctx.memory.read_tldr(&room_id),
+            ctx.memory.read_digest(),
         )
     } else {
-        (String::new(), String::new(), String::new())
+        (String::new(), String::new(), String::new(), String::new())
     };
     let skills_index = ctx
         .skills
@@ -482,6 +485,7 @@ async fn process_turn(ctx: &BotCtx, agentic_gate: &Arc<Semaphore>, turn: Turn) {
         &operating_room,
         &memory_global,
         &memory_room,
+        &memory_digest,
         &skills_index,
     );
 
@@ -1452,6 +1456,7 @@ mod tests {
             "- global fact",
             "- room fact",
             "",
+            "",
         );
         // TLDR appears before operating instructions
         let tldr_pos = result.find("Working on feature X").unwrap();
@@ -1471,9 +1476,28 @@ mod tests {
             "",
             "",
             "",
+            "",
         );
         assert!(!result.contains("## Current state (TLDR)"));
         assert!(result.contains("Be concise."));
+    }
+
+    #[test]
+    fn assemble_system_prompt_digest_injected_after_memory() {
+        let result = assemble_system_prompt(
+            "You are a bot.",
+            "",
+            "",
+            "",
+            "- global thing",
+            "",
+            "- theme: rust everywhere",
+            "",
+        );
+        let global_pos = result.find("global thing").unwrap();
+        let digest_pos = result.find("theme: rust everywhere").unwrap();
+        assert!(global_pos < digest_pos, "global memory must come before digest");
+        assert!(result.contains("Weekly digest"));
     }
 
     #[tokio::test]
