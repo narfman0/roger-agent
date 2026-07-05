@@ -59,6 +59,83 @@ struct Delta {
     content: Option<String>,
 }
 
+/// Parse GLM's native XML-style tool calls from a text response.
+///
+/// GLM-5.2 (via OpenRouter/LiteLLM) sometimes emits tool calls as XML in the
+/// message content rather than as structured `tool_calls` fields:
+///
+///   <tool_call>fn_name<arg_key>k</arg_key><arg_value>v</arg_value>…</tool_call>
+///
+/// This function finds all such blocks and converts them to `ToolCall` objects.
+/// Returns an empty vec if no XML tool calls are present.
+fn parse_glm_tool_calls(text: &str) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+    let mut search = text;
+    let mut id_counter: u32 = 0;
+    while let Some(start) = search.find("<tool_call>") {
+        let after_open = &search[start + "<tool_call>".len()..];
+        let end = match after_open.find("</tool_call>") {
+            Some(e) => e,
+            None => break,
+        };
+        let inner = &after_open[..end];
+        search = &after_open[end + "</tool_call>".len()..];
+
+        // Function name is the text before the first <arg_key> (or the whole inner
+        // if there are no args).
+        let (fn_name, args_text) = match inner.find("<arg_key>") {
+            Some(p) => (inner[..p].trim(), &inner[p..]),
+            None => (inner.trim(), ""),
+        };
+        if fn_name.is_empty() {
+            continue;
+        }
+
+        // Build a JSON object from interleaved <arg_key>/<arg_value> pairs.
+        let mut obj = serde_json::Map::new();
+        let mut remaining = args_text;
+        while let Some(ks) = remaining.find("<arg_key>") {
+            let after_ks = &remaining[ks + "<arg_key>".len()..];
+            let ke = match after_ks.find("</arg_key>") {
+                Some(e) => e,
+                None => break,
+            };
+            let key = after_ks[..ke].trim().to_string();
+            let after_ke = &after_ks[ke + "</arg_key>".len()..];
+
+            let vs = after_ke.find("<arg_value>").unwrap_or(after_ke.len());
+            let after_vs = &after_ke[vs..];
+            let value = if let Some(stripped) = after_vs.strip_prefix("<arg_value>") {
+                let ve = stripped.find("</arg_value>").unwrap_or(stripped.len());
+                let v = stripped[..ve].trim().to_string();
+                remaining = if ve + "</arg_value>".len() <= stripped.len() {
+                    &stripped[ve + "</arg_value>".len()..]
+                } else {
+                    ""
+                };
+                v
+            } else {
+                remaining = "";
+                String::new()
+            };
+            if !key.is_empty() {
+                obj.insert(key, serde_json::Value::String(value));
+            }
+        }
+
+        id_counter += 1;
+        calls.push(ToolCall {
+            id: format!("glm_{}", id_counter),
+            kind: "function".to_string(),
+            function: crate::tools::ToolFunction {
+                name: fn_name.to_string(),
+                arguments: serde_json::Value::Object(obj).to_string(),
+            },
+        });
+    }
+    calls
+}
+
 /// Parse one SSE line. Returns the content delta for `data:` lines carrying a
 /// chunk, `None` for comments, blanks, `[DONE]`, or chunks without content.
 fn parse_sse_line(line: &str) -> Option<String> {
@@ -206,26 +283,41 @@ impl LlmClient {
                 .ok_or_else(|| anyhow::anyhow!("empty choices"))?;
 
             let finish = choice.finish_reason.as_deref().unwrap_or("");
+            let content_text = choice.message.content.unwrap_or_default();
 
-            if finish != "tool_calls" || choice.message.tool_calls.is_none() {
+            // Resolve tool calls: prefer structured field, fall back to GLM XML in content.
+            let tool_calls_opt: Option<Vec<ToolCall>> = if finish == "tool_calls" {
+                choice.message.tool_calls
+            } else if content_text.contains("<tool_call>") {
+                let xml_calls = parse_glm_tool_calls(&content_text);
+                if xml_calls.is_empty() { None } else {
+                    info!("parsed {} GLM XML tool call(s) from content", xml_calls.len());
+                    Some(xml_calls)
+                }
+            } else {
+                None
+            };
+
+            if tool_calls_opt.is_none() {
                 // Final answer — stream it
-                let final_text = choice.message.content.unwrap_or_default();
-                if !final_text.is_empty() {
-                    let _ = tx.send(final_text.clone()).await;
-                    return Ok(final_text);
+                if !content_text.is_empty() {
+                    let _ = tx.send(content_text.clone()).await;
+                    return Ok(content_text);
                 }
                 // Empty content and no tool calls — fall through to streaming
                 break;
             }
 
             // Execute tool calls and append results
-            let tool_calls = choice.message.tool_calls.unwrap();
+            let tool_calls = tool_calls_opt.unwrap();
             info!("tool round {}: {} call(s)", round + 1, tool_calls.len());
 
-            // Append assistant message with tool_calls
+            // Append assistant message with tool_calls. For XML-style calls the
+            // content_text holds the raw XML; set it to null so downstream
+            // sees only structured tool_calls (avoids confusing re-injection).
             msg_values.push(serde_json::json!({
                 "role": "assistant",
-                "content": null,
+                "content": serde_json::Value::Null,
                 "tool_calls": tool_calls
             }));
 
@@ -486,6 +578,58 @@ mod tests {
     #[test]
     fn sse_handles_empty_choices() {
         assert_eq!(parse_sse_line(r#"data: {"choices":[]}"#), None);
+    }
+
+    #[test]
+    fn glm_xml_single_call_no_args() {
+        let text = "<tool_call>list_dir</tool_call>";
+        let calls = parse_glm_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "list_dir");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert!(args.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn glm_xml_single_call_with_args() {
+        let text = "<tool_call>read_file<arg_key>path</arg_key><arg_value>~/workspace/roger-agent/src/llm.rs</arg_value></tool_call>";
+        let calls = parse_glm_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["path"], "~/workspace/roger-agent/src/llm.rs");
+    }
+
+    #[test]
+    fn glm_xml_multiple_calls() {
+        let text = "<tool_call>read_file<arg_key>path</arg_key><arg_value>/a</arg_value></tool_call> some text <tool_call>list_dir<arg_key>path</arg_key><arg_value>/b</arg_value></tool_call>";
+        let calls = parse_glm_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[1].function.name, "list_dir");
+    }
+
+    #[test]
+    fn glm_xml_multiple_args() {
+        let text = "<tool_call>web_search<arg_key>query</arg_key><arg_value>rust async</arg_value><arg_key>limit</arg_key><arg_value>5</arg_value></tool_call>";
+        let calls = parse_glm_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["query"], "rust async");
+        assert_eq!(args["limit"], "5");
+    }
+
+    #[test]
+    fn glm_xml_no_calls_returns_empty() {
+        assert!(parse_glm_tool_calls("Just a regular response with no tool calls.").is_empty());
+    }
+
+    #[test]
+    fn glm_xml_ids_are_unique() {
+        let text = "<tool_call>read_file<arg_key>path</arg_key><arg_value>/a</arg_value></tool_call><tool_call>read_file<arg_key>path</arg_key><arg_value>/b</arg_value></tool_call>";
+        let calls = parse_glm_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0].id, calls[1].id);
     }
 
     fn dead_client(model: &str) -> Arc<Backend> {
